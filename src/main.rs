@@ -1,13 +1,3 @@
 fn main() {
-    println!("Hello, world!");
+    println!("Hello!  This is not the entrypoint for the emulator.  Please execute the desktop or headless binary instead.");
 }
-/**
- * 
- * cargo run -p gb-desktop -- \
-  --rom "/Users/evanputnam/Workplace/gb-emulator/roms/Pokemon - Yellow Version - Special Pikachu Edition (USA, Europe).gb" \
-  --boot-rom /absolute/path/to/dmg_boot.bin \
-  --save-in /absolute/path/to/game.sav \
-  --save-out /absolute/path/to/game.sav \
-  --max-cycles 5000000 \
-  --mute
- */
