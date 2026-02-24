@@ -1,20 +1,20 @@
 use gb_core::apu::Apu;
 
-fn write_reg(io: &mut [u8; 0x80], write_mask: &mut [bool; 0x80], index: usize, value: u8) {
+fn write_reg(io: &mut [u8; 0x80], write_mask: &mut u128, index: usize, value: u8) {
     io[index] = value;
-    write_mask[index] = true;
+    *write_mask |= 1u128 << index;
 }
 
-fn tick(apu: &mut Apu, io: &mut [u8; 0x80], write_mask: &mut [bool; 0x80], cycles: u32) {
-    apu.tick(cycles, io, write_mask)
+fn tick(apu: &mut Apu, io: &mut [u8; 0x80], write_mask: &mut u128, cycles: u32) {
+    apu.tick(cycles, io, *write_mask)
         .expect("apu tick should pass");
-    write_mask.fill(false);
+    *write_mask = 0;
 }
 
 fn run_script() -> Vec<i16> {
     let mut apu = Apu::new();
     let mut io = [0u8; 0x80];
-    let mut write_mask = [false; 0x80];
+    let mut write_mask = 0u128;
 
     io[0x26] = 0x80;
     io[0x24] = 0x77;

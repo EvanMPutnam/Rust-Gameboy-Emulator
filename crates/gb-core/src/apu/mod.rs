@@ -429,7 +429,7 @@ impl Apu {
         &mut self,
         cycles: Cycles,
         io: &mut [u8; 0x80],
-        write_mask: &[bool; 0x80],
+        write_mask: u128,
     ) -> Result<(), ApuError> {
         self.apply_power_state(io, write_mask);
         if !self.enabled {
@@ -482,10 +482,16 @@ impl Apu {
 
     #[must_use]
     pub fn take_samples(&mut self) -> Vec<i16> {
-        core::mem::take(&mut self.sample_buffer)
+        let mut out = Vec::new();
+        self.drain_samples_into(&mut out);
+        out
     }
 
-    fn apply_power_state(&mut self, io: &mut [u8; 0x80], write_mask: &[bool; 0x80]) {
+    pub fn drain_samples_into(&mut self, out: &mut Vec<i16>) {
+        out.append(&mut self.sample_buffer);
+    }
+
+    fn apply_power_state(&mut self, io: &mut [u8; 0x80], write_mask: u128) {
         let power_on = (io[0x26] & 0x80) != 0;
         if power_on {
             if !self.enabled {
@@ -495,7 +501,7 @@ impl Apu {
             return;
         }
 
-        if self.enabled || write_mask[0x26] {
+        if self.enabled || write_mask_has(write_mask, 0x26) {
             self.power_off(io);
         }
     }
@@ -521,30 +527,34 @@ impl Apu {
         clippy::too_many_lines,
         reason = "APU register matrix is intentionally explicit per hardware register."
     )]
-    fn apply_register_writes(&mut self, io: &mut [u8; 0x80], write_mask: &[bool; 0x80]) {
+    fn apply_register_writes(&mut self, io: &mut [u8; 0x80], write_mask: u128) {
+        if write_mask == 0 {
+            return;
+        }
+
         if !self.enabled {
-            for (index, register) in io.iter_mut().enumerate().take(0x26).skip(0x10) {
-                if write_mask[index] {
-                    *register = 0;
+            for index in 0x10u8..0x26 {
+                if write_mask_has(write_mask, index) {
+                    io[usize::from(index)] = 0;
                 }
             }
             return;
         }
 
-        if write_mask[0x10] {
+        if write_mask_has(write_mask, 0x10) {
             self.ch1_sweep.write_nr10(io[0x10]);
         }
-        if write_mask[0x11] {
+        if write_mask_has(write_mask, 0x11) {
             self.ch1.duty = (io[0x11] >> 6) & 0x03;
             self.ch1.length_counter = 64 - u16::from(io[0x11] & 0x3F);
         }
-        if write_mask[0x12] {
+        if write_mask_has(write_mask, 0x12) {
             self.ch1.apply_envelope_write(io[0x12]);
         }
-        if write_mask[0x13] {
+        if write_mask_has(write_mask, 0x13) {
             self.ch1.freq = (self.ch1.freq & 0x0700) | u16::from(io[0x13]);
         }
-        if write_mask[0x14] {
+        if write_mask_has(write_mask, 0x14) {
             self.ch1.length_enabled = (io[0x14] & 0x40) != 0;
             self.ch1.freq = (self.ch1.freq & 0x00FF) | (u16::from(io[0x14] & 0x07) << 8);
             if (io[0x14] & 0x80) != 0 {
@@ -554,17 +564,17 @@ impl Apu {
             }
         }
 
-        if write_mask[0x16] {
+        if write_mask_has(write_mask, 0x16) {
             self.ch2.duty = (io[0x16] >> 6) & 0x03;
             self.ch2.length_counter = 64 - u16::from(io[0x16] & 0x3F);
         }
-        if write_mask[0x17] {
+        if write_mask_has(write_mask, 0x17) {
             self.ch2.apply_envelope_write(io[0x17]);
         }
-        if write_mask[0x18] {
+        if write_mask_has(write_mask, 0x18) {
             self.ch2.freq = (self.ch2.freq & 0x0700) | u16::from(io[0x18]);
         }
-        if write_mask[0x19] {
+        if write_mask_has(write_mask, 0x19) {
             self.ch2.length_enabled = (io[0x19] & 0x40) != 0;
             self.ch2.freq = (self.ch2.freq & 0x00FF) | (u16::from(io[0x19] & 0x07) << 8);
             if (io[0x19] & 0x80) != 0 {
@@ -573,22 +583,22 @@ impl Apu {
             }
         }
 
-        if write_mask[0x1A] {
+        if write_mask_has(write_mask, 0x1A) {
             self.ch3.dac_enabled = (io[0x1A] & 0x80) != 0;
             if !self.ch3.dac_enabled {
                 self.ch3.enabled = false;
             }
         }
-        if write_mask[0x1B] {
+        if write_mask_has(write_mask, 0x1B) {
             self.ch3.length_counter = 256 - u16::from(io[0x1B]);
         }
-        if write_mask[0x1C] {
+        if write_mask_has(write_mask, 0x1C) {
             self.ch3.volume_code = (io[0x1C] >> 5) & 0x03;
         }
-        if write_mask[0x1D] {
+        if write_mask_has(write_mask, 0x1D) {
             self.ch3.freq = (self.ch3.freq & 0x0700) | u16::from(io[0x1D]);
         }
-        if write_mask[0x1E] {
+        if write_mask_has(write_mask, 0x1E) {
             self.ch3.length_enabled = (io[0x1E] & 0x40) != 0;
             self.ch3.freq = (self.ch3.freq & 0x00FF) | (u16::from(io[0x1E] & 0x07) << 8);
             if (io[0x1E] & 0x80) != 0 {
@@ -597,18 +607,18 @@ impl Apu {
             }
         }
 
-        if write_mask[0x20] {
+        if write_mask_has(write_mask, 0x20) {
             self.ch4.length_counter = 64 - u16::from(io[0x20] & 0x3F);
         }
-        if write_mask[0x21] {
+        if write_mask_has(write_mask, 0x21) {
             self.ch4.apply_envelope_write(io[0x21]);
         }
-        if write_mask[0x22] {
+        if write_mask_has(write_mask, 0x22) {
             self.ch4.clock_shift = (io[0x22] >> 4) & 0x0F;
             self.ch4.width_mode = (io[0x22] & 0x08) != 0;
             self.ch4.divisor_code = io[0x22] & 0x07;
         }
-        if write_mask[0x23] {
+        if write_mask_has(write_mask, 0x23) {
             self.ch4.length_enabled = (io[0x23] & 0x40) != 0;
             if (io[0x23] & 0x80) != 0 {
                 self.ch4.trigger();
@@ -692,6 +702,10 @@ fn i16_from_clamped_i32(value: i32) -> i16 {
         Err(_) if value < 0 => i16::MIN,
         Err(_) => i16::MAX,
     }
+}
+
+fn write_mask_has(mask: u128, index: u8) -> bool {
+    (mask & (1u128 << index)) != 0
 }
 
 #[cfg(test)]

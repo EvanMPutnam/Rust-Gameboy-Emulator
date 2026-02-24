@@ -424,14 +424,14 @@ impl Ppu {
     ) -> SpriteCompositionStats {
         let lcdc = bus.io[0x40];
         let sprite_height: u8 = if (lcdc & 0x04) != 0 { 16 } else { 8 };
-        let sprites = collect_sprites_for_line(ly, sprite_height, bus);
+        let (sprites, sprite_count) = collect_sprites_for_line(ly, sprite_height, bus);
         let mut stats = SpriteCompositionStats {
-            sprites_on_line: u8::try_from(sprites.len()).unwrap_or(u8::MAX),
+            sprites_on_line: sprite_count as u8,
             ..SpriteCompositionStats::default()
         };
 
         for x in 0..SCREEN_WIDTH {
-            for sprite in &sprites {
+            for sprite in &sprites[..sprite_count] {
                 let sprite_x = sprite.x.wrapping_sub(8);
                 let sprite_y = sprite.y.wrapping_sub(16);
 
@@ -531,8 +531,9 @@ impl Ppu {
     }
 }
 
-fn collect_sprites_for_line(ly: u8, height: u8, bus: &Bus) -> Vec<SpriteCandidate> {
-    let mut sprites = Vec::with_capacity(10);
+fn collect_sprites_for_line(ly: u8, height: u8, bus: &Bus) -> ([SpriteCandidate; 10], usize) {
+    let mut sprites = [SpriteCandidate::default(); 10];
+    let mut len = 0usize;
 
     for index in 0u8..40 {
         let base = usize::from(index) * 4;
@@ -544,21 +545,32 @@ fn collect_sprites_for_line(ly: u8, height: u8, bus: &Bus) -> Vec<SpriteCandidat
         let sprite_y = y.wrapping_sub(16);
         let line = ly.wrapping_sub(sprite_y);
         if line < height {
-            sprites.push(SpriteCandidate {
+            let candidate = SpriteCandidate {
                 x,
                 y,
                 tile,
                 attr,
                 oam_index: index,
-            });
-            if sprites.len() == 10 {
+            };
+
+            let mut insert_at = len;
+            while insert_at > 0 && sprite_cmp(candidate, sprites[insert_at - 1]).is_lt() {
+                sprites[insert_at] = sprites[insert_at - 1];
+                insert_at -= 1;
+            }
+            sprites[insert_at] = candidate;
+            len += 1;
+            if len == sprites.len() {
                 break;
             }
         }
     }
 
-    sprites.sort_by_key(|sprite| (sprite.x, sprite.oam_index));
-    sprites
+    (sprites, len)
+}
+
+fn sprite_cmp(a: SpriteCandidate, b: SpriteCandidate) -> core::cmp::Ordering {
+    a.x.cmp(&b.x).then(a.oam_index.cmp(&b.oam_index))
 }
 
 fn palette_map(palette: u8, color: u8) -> u8 {

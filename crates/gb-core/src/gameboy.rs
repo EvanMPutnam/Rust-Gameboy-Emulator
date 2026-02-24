@@ -65,7 +65,6 @@ impl GameBoy {
     pub fn step(&mut self) -> Result<Cycles, GbError> {
         self.sync_interrupts_from_bus();
         self.sync_timers_from_bus();
-        self.sync_debug_to_bus();
 
         if self.debugger.enabled() {
             let pc = self.cpu.registers().pc;
@@ -87,7 +86,7 @@ impl GameBoy {
         self.bus.tick_serial(cycles, &mut self.interrupts);
         self.ppu.tick(cycles, &mut self.bus, &mut self.interrupts)?;
         let apu_write_mask = self.bus.take_apu_write_mask();
-        self.apu.tick(cycles, &mut self.bus.io, &apu_write_mask)?;
+        self.apu.tick(cycles, &mut self.bus.io, apu_write_mask)?;
 
         if let Some(vector) = self.cpu.take_last_serviced_interrupt_vector() {
             self.debugger
@@ -122,7 +121,13 @@ impl GameBoy {
 
     #[must_use]
     pub fn take_audio_samples(&mut self) -> Vec<i16> {
-        self.apu.take_samples()
+        let mut out = Vec::new();
+        self.drain_audio_samples_into(&mut out);
+        out
+    }
+
+    pub fn drain_audio_samples_into(&mut self, out: &mut Vec<i16>) {
+        self.apu.drain_samples_into(out);
     }
 
     pub fn set_button(&mut self, button: GbButton, pressed: bool) -> Result<(), GbError> {

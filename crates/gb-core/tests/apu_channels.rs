@@ -1,14 +1,14 @@
 use gb_core::apu::Apu;
 
-fn write_reg(io: &mut [u8; 0x80], write_mask: &mut [bool; 0x80], index: usize, value: u8) {
+fn write_reg(io: &mut [u8; 0x80], write_mask: &mut u128, index: usize, value: u8) {
     io[index] = value;
-    write_mask[index] = true;
+    *write_mask |= 1u128 << index;
 }
 
-fn tick(apu: &mut Apu, io: &mut [u8; 0x80], write_mask: &mut [bool; 0x80], cycles: u32) {
-    apu.tick(cycles, io, write_mask)
+fn tick(apu: &mut Apu, io: &mut [u8; 0x80], write_mask: &mut u128, cycles: u32) {
+    apu.tick(cycles, io, *write_mask)
         .expect("apu tick should pass");
-    write_mask.fill(false);
+    *write_mask = 0;
 }
 
 fn max_abs_sample(samples: &[i16]) -> i16 {
@@ -19,7 +19,7 @@ fn max_abs_sample(samples: &[i16]) -> i16 {
 fn channel_trigger_generates_audio_samples() {
     let mut apu = Apu::new();
     let mut io = [0u8; 0x80];
-    let mut write_mask = [false; 0x80];
+    let mut write_mask = 0u128;
 
     io[0x26] = 0x80;
     io[0x24] = 0x77;
@@ -41,7 +41,7 @@ fn channel_trigger_generates_audio_samples() {
 fn nr52_disable_clears_channel_state() {
     let mut apu = Apu::new();
     let mut io = [0u8; 0x80];
-    let mut write_mask = [false; 0x80];
+    let mut write_mask = 0u128;
 
     io[0x26] = 0x80;
     io[0x24] = 0x77;
@@ -64,7 +64,7 @@ fn nr52_disable_clears_channel_state() {
 fn stereo_routing_applies_nr51_mask() {
     let mut apu = Apu::new();
     let mut io = [0u8; 0x80];
-    let mut write_mask = [false; 0x80];
+    let mut write_mask = 0u128;
 
     io[0x26] = 0x80;
     io[0x24] = 0x77;
@@ -100,7 +100,7 @@ fn stereo_routing_applies_nr51_mask() {
 fn length_counter_expires_without_constant_register_reloads() {
     let mut apu = Apu::new();
     let mut io = [0u8; 0x80];
-    let mut write_mask = [false; 0x80];
+    let mut write_mask = 0u128;
 
     io[0x26] = 0x80;
     io[0x24] = 0x77;
@@ -122,7 +122,7 @@ fn length_counter_expires_without_constant_register_reloads() {
 fn trigger_reloads_envelope_volume_without_rewriting_envelope_register() {
     let mut apu = Apu::new();
     let mut io = [0u8; 0x80];
-    let mut write_mask = [false; 0x80];
+    let mut write_mask = 0u128;
 
     io[0x26] = 0x80;
     io[0x24] = 0x77;
@@ -149,7 +149,7 @@ fn trigger_reloads_envelope_volume_without_rewriting_envelope_register() {
 fn channel_one_sweep_overflow_disables_channel() {
     let mut apu = Apu::new();
     let mut io = [0u8; 0x80];
-    let mut write_mask = [false; 0x80];
+    let mut write_mask = 0u128;
 
     io[0x26] = 0x80;
     io[0x24] = 0x77;
@@ -169,7 +169,7 @@ fn channel_one_sweep_overflow_disables_channel() {
 fn wave_dac_disable_turns_channel_off_immediately() {
     let mut apu = Apu::new();
     let mut io = [0u8; 0x80];
-    let mut write_mask = [false; 0x80];
+    let mut write_mask = 0u128;
 
     io[0x26] = 0x80;
     io[0x24] = 0x77;
@@ -194,7 +194,7 @@ fn wave_dac_disable_turns_channel_off_immediately() {
 fn writes_are_ignored_while_apu_power_is_off() {
     let mut apu = Apu::new();
     let mut io = [0u8; 0x80];
-    let mut write_mask = [false; 0x80];
+    let mut write_mask = 0u128;
 
     write_reg(&mut io, &mut write_mask, 0x12, 0xF3);
     write_reg(&mut io, &mut write_mask, 0x14, 0x80);

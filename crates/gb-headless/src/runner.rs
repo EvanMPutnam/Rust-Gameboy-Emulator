@@ -109,6 +109,7 @@ pub fn run(config: &RunnerConfig) -> Result<RunReport, RunnerError> {
     let mut frames_produced = 0u64;
     let mut frame_hash = None;
     let mut audio_hash = None;
+    let mut audio_samples = Vec::new();
     let frame_timeout = match config.budget {
         RunBudget::Frames(frames) => u64::from(frames).saturating_mul(90_000),
         RunBudget::Cycles(_) => u64::MAX,
@@ -141,9 +142,10 @@ pub fn run(config: &RunnerConfig) -> Result<RunReport, RunnerError> {
             frame_hash = Some(hash_bytes(&frame));
         }
 
-        let samples = gameboy.take_audio_samples();
-        if !samples.is_empty() {
-            let current = hash_samples(&samples);
+        audio_samples.clear();
+        gameboy.drain_audio_samples_into(&mut audio_samples);
+        if !audio_samples.is_empty() {
+            let current = hash_samples(&audio_samples);
             audio_hash = Some(audio_hash.map_or(current, |prior: u64| prior ^ current));
         }
     }

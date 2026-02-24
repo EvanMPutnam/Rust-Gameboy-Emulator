@@ -18,12 +18,12 @@ fn same_value_apu_register_writes_are_still_reported() {
 
     bus.write8(0xFF12, 0xF3).expect("first write should pass");
     let first = bus.take_apu_write_mask();
-    assert!(first[0x12]);
+    assert_ne!(first & (1u128 << 0x12), 0);
 
     bus.write8(0xFF12, 0xF3)
         .expect("same-value write should pass");
     let second = bus.take_apu_write_mask();
-    assert!(second[0x12]);
+    assert_ne!(second & (1u128 << 0x12), 0);
 }
 
 #[test]
@@ -33,6 +33,6 @@ fn non_apu_writes_do_not_set_apu_write_mask() {
     bus.write8(0xFF40, 0x91)
         .expect("non-apu register write should pass");
     let write_mask = bus.take_apu_write_mask();
-    assert!(!write_mask[0x40]);
-    assert!(!write_mask[0x10]);
+    assert_eq!(write_mask & (1u128 << 0x40), 0);
+    assert_eq!(write_mask & (1u128 << 0x10), 0);
 }

@@ -67,7 +67,7 @@ pub struct Bus {
     dma_active: bool,
     dma_start_request: Option<u8>,
     #[serde(skip)]
-    apu_write_mask: Vec<bool>,
+    apu_write_mask: u128,
     #[serde(skip)]
     debug: DebugTraceState,
 }
@@ -97,7 +97,7 @@ impl Bus {
             oam_blocked: false,
             dma_active: false,
             dma_start_request: None,
-            apu_write_mask: vec![false; 0x80],
+            apu_write_mask: 0,
             debug: DebugTraceState::default(),
         }
     }
@@ -205,12 +205,9 @@ impl Bus {
     }
 
     #[must_use]
-    pub fn take_apu_write_mask(&mut self) -> [bool; 0x80] {
-        let mut mask = [false; 0x80];
-        for (index, written) in self.apu_write_mask.iter_mut().enumerate().take(0x80) {
-            mask[index] = *written;
-            *written = false;
-        }
+    pub fn take_apu_write_mask(&mut self) -> u128 {
+        let mask = self.apu_write_mask;
+        self.apu_write_mask = 0;
         mask
     }
 
@@ -398,7 +395,7 @@ impl Memory for Bus {
                     let index = usize::from(addr - IO_START);
                     self.io[index] = val;
                     if (0x10..=0x26).contains(&index) || (0x30..=0x3F).contains(&index) {
-                        self.apu_write_mask[index] = true;
+                        self.apu_write_mask |= 1u128 << index;
                     }
                 }
             },

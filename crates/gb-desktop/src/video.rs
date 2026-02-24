@@ -108,11 +108,6 @@ impl VideoPresenter {
     }
 
     pub fn render_rgba(&mut self, target: &mut [u8], surface_width: u32, surface_height: u32) {
-        fill_black(target);
-        let Some(frame) = self.last_frame else {
-            return;
-        };
-
         let Some(surface_width_usize) = usize::try_from(surface_width).ok() else {
             return;
         };
@@ -141,8 +136,14 @@ impl VideoPresenter {
             return;
         }
 
+        let Some(frame) = self.last_frame.as_ref() else {
+            fill_black(target);
+            return;
+        };
+
         let viewport = build_viewport(surface_width, surface_height, self.present_size);
         if viewport.width == 0 || viewport.height == 0 {
+            fill_black(target);
             self.record_upload_diagnostics(UploadRecordInput {
                 surface_width,
                 surface_height,
@@ -168,31 +169,35 @@ impl VideoPresenter {
             return;
         };
 
-        let mut rendered_pixels = 0u32;
+        let viewport_covers_surface = viewport.width == surface_width
+            && viewport.height == surface_height
+            && viewport.x == 0
+            && viewport.y == 0;
+        if !viewport_covers_surface {
+            fill_black(target);
+        }
+
+        let row_stride = surface_width_usize.saturating_mul(4);
         for y in 0..viewport_height {
-            let src_y = y.saturating_mul(SCREEN_HEIGHT) / viewport_height;
+            let src_y = y * SCREEN_HEIGHT / viewport_height;
+            let src_row = src_y * SCREEN_WIDTH;
+            let dst_row = (viewport_y + y)
+                .saturating_mul(row_stride)
+                .saturating_add(viewport_x.saturating_mul(4));
             for x in 0..viewport_width {
-                let src_x = x.saturating_mul(SCREEN_WIDTH) / viewport_width;
-                let shade = frame[src_y.saturating_mul(SCREEN_WIDTH).saturating_add(src_x)];
+                let src_x = x * SCREEN_WIDTH / viewport_width;
+                let shade = frame[src_row + src_x];
                 let [r, g, b] = shade_to_rgb(shade);
 
-                let dst_x = viewport_x.saturating_add(x);
-                let dst_y = viewport_y.saturating_add(y);
-                let base = dst_y
-                    .saturating_mul(surface_width_usize)
-                    .saturating_add(dst_x)
-                    .saturating_mul(4);
-
-                if let Some(pixel) = target.get_mut(base..base.saturating_add(4)) {
-                    pixel[0] = r;
-                    pixel[1] = g;
-                    pixel[2] = b;
-                    pixel[3] = u8::MAX;
-                    rendered_pixels = rendered_pixels.saturating_add(1);
-                }
+                let base = dst_row + x * 4;
+                target[base] = r;
+                target[base + 1] = g;
+                target[base + 2] = b;
+                target[base + 3] = u8::MAX;
             }
         }
 
+        let rendered_pixels = viewport.width.saturating_mul(viewport.height);
         self.record_upload_diagnostics(UploadRecordInput {
             surface_width,
             surface_height,

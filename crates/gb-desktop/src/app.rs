@@ -81,6 +81,7 @@ pub struct DesktopApp {
     audio: AudioQueue,
     runloop: RunLoop,
     audio_accumulator: CoreAudioAccumulator,
+    audio_scratch: Vec<i16>,
     latest_ppu_diagnostics: Option<PpuFrameDiagnostics>,
 }
 
@@ -108,6 +109,7 @@ impl DesktopApp {
                 clipped_samples: 0,
                 amplitude_buckets: [0; 5],
             },
+            audio_scratch: Vec::new(),
             latest_ppu_diagnostics: None,
         })
     }
@@ -169,10 +171,12 @@ impl DesktopApp {
             frames_presented = frames_presented.wrapping_add(1);
         }
 
-        let samples = self.gameboy.take_audio_samples();
-        self.audio_accumulator.observe(&samples);
-        let audio_samples_enqueued = samples.len();
-        self.audio.enqueue(&samples);
+        self.audio_scratch.clear();
+        self.gameboy
+            .drain_audio_samples_into(&mut self.audio_scratch);
+        self.audio_accumulator.observe(&self.audio_scratch);
+        let audio_samples_enqueued = self.audio_scratch.len();
+        self.audio.enqueue(&self.audio_scratch);
 
         Ok(TickSummary {
             cycles_ran,
