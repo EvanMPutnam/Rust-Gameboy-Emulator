@@ -1,0 +1,6 @@
+[[rom]]
+id = "minimal-full"
+path = "../roms/minimal.gb"
+max_cycles = 65536
+expected = "pass"
+tags = ["full", "cpu", "timing", "ppu", "apu"]

@@ -1,0 +1,6 @@
+[[rom]]
+id = "minimal-core"
+path = "../roms/minimal.gb"
+max_cycles = 16384
+expected = "pass"
+tags = ["core", "cpu", "timing", "io"]
