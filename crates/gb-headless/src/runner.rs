@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use gb_core::{CartridgeSave, GameBoy, GbButton, GbConfig, GbError};
 
-use crate::report::{RunReport, hash_bytes, hash_samples};
+use crate::report::{AudioDiagnosticsReport, RunReport, hash_bytes, hash_samples};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunBudget {
@@ -21,6 +21,8 @@ pub struct RunnerConfig {
     pub input_script_path: Option<PathBuf>,
     pub save_in_path: Option<PathBuf>,
     pub save_out_path: Option<PathBuf>,
+    pub audio_diagnostics: bool,
+    pub audio_channel_diagnostics: bool,
 }
 
 #[derive(Debug)]
@@ -85,6 +87,9 @@ pub fn run(config: &RunnerConfig) -> Result<RunReport, RunnerError> {
     }
 
     let mut gameboy = GameBoy::new(gb_config, rom)?;
+    if config.audio_diagnostics {
+        gameboy.set_apu_diagnostics_enabled(true, config.audio_channel_diagnostics);
+    }
 
     if let Some(path) = &config.save_in_path {
         let save_ram = fs::read(path)?;
@@ -161,6 +166,11 @@ pub fn run(config: &RunnerConfig) -> Result<RunReport, RunnerError> {
         frames_produced,
         frame_hash,
         audio_hash,
+        audio_diagnostics: if config.audio_diagnostics {
+            gameboy.apu_diagnostics().map(AudioDiagnosticsReport::from)
+        } else {
+            None
+        },
     })
 }
 
@@ -281,6 +291,8 @@ mod tests {
             input_script_path: None,
             save_in_path: None,
             save_out_path: None,
+            audio_diagnostics: false,
+            audio_channel_diagnostics: false,
         };
 
         let first = run(&config).expect("run first");

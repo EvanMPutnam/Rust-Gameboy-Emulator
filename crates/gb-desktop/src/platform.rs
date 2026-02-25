@@ -38,6 +38,7 @@ pub fn run(options: LaunchOptions) -> Result<(), DesktopError> {
 
     let mut app = DesktopApp::from_rom_bytes(rom, boot_rom.as_ref())?;
     app.set_video_diagnostics_enabled(options.video_diagnostics);
+    app.set_audio_diagnostics_enabled(options.audio_diagnostics, false);
     if let Some(path) = &options.save_in_path {
         app.load_save_from_path(path)?;
     }
@@ -77,7 +78,7 @@ struct DesktopRuntime {
     options: LaunchOptions,
     snapshot_path: PathBuf,
     app: DesktopApp,
-    _audio: Option<AudioBackend>,
+    audio_backend: Option<AudioBackend>,
     window: Option<Arc<Window>>,
     window_id: Option<WindowId>,
     pixels: Option<Pixels<'static>>,
@@ -95,6 +96,7 @@ struct AudioDiagCheckpoint {
     callback_requested_samples: u64,
     dropped_samples: u64,
     underflow_events: u64,
+    underflow_silence_samples: u64,
     callback_calls: u64,
 }
 
@@ -110,7 +112,7 @@ impl DesktopRuntime {
             options,
             snapshot_path,
             app,
-            _audio: audio,
+            audio_backend: audio,
             window: None,
             window_id: None,
             pixels: None,
@@ -319,6 +321,10 @@ impl DesktopRuntime {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Audio diagnostics intentionally print a single coherent snapshot for support logs."
+    )]
     fn maybe_report_audio_diagnostics(&mut self, now: Instant) {
         if !self.options.audio_diagnostics {
             return;
@@ -342,6 +348,7 @@ impl DesktopRuntime {
             callback_requested_samples: queue.callback_requested_samples,
             dropped_samples: queue.dropped_samples,
             underflow_events: queue.underflow_events,
+            underflow_silence_samples: queue.underflow_silence_samples,
             callback_calls: queue.callback_calls,
         };
 
@@ -351,6 +358,7 @@ impl DesktopRuntime {
             callback_rate,
             dropped_delta,
             underflow_delta,
+            underflow_silence_delta,
             callback_delta,
         ) = if let Some(previous) = self.last_audio_diag_checkpoint {
             (
@@ -378,59 +386,89 @@ impl DesktopRuntime {
                 current
                     .underflow_events
                     .wrapping_sub(previous.underflow_events),
+                current
+                    .underflow_silence_samples
+                    .wrapping_sub(previous.underflow_silence_samples),
                 current.callback_calls.wrapping_sub(previous.callback_calls),
             )
         } else {
-            (0, 0, 0, 0, 0, 0)
+            (0, 0, 0, 0, 0, 0, 0)
         };
 
-        let core = diagnostics.core;
-        let dc_offset = if core.total_samples == 0 {
-            0
-        } else {
-            let total_samples = match i64::try_from(core.total_samples) {
-                Ok(value) if value != 0 => value,
-                Ok(_) | Err(_) => 1,
+        let backend = self.audio_backend.as_ref().map(AudioBackend::diagnostics);
+        let expected_callback_rate = backend.map_or(0, |info| {
+            let channels_as_u64 = match u64::try_from(info.channels) {
+                Ok(value) => value,
+                Err(_) => u64::MAX,
             };
-            core.sample_sum / total_samples
-        };
-        let clipping_ppm = if core.total_samples == 0 {
-            0
+            u64::from(info.output_rate_hz).saturating_mul(channels_as_u64)
+        });
+        let callback_rate_delta = if expected_callback_rate > callback_rate {
+            expected_callback_rate.wrapping_sub(callback_rate)
         } else {
-            parts_per_million(core.clipped_samples, core.total_samples)
+            callback_rate.wrapping_sub(expected_callback_rate)
+        };
+
+        let core_summary = if let Some(core) = diagnostics.core {
+            let dc_offset = if core.total_samples == 0 {
+                0
+            } else {
+                let total_samples = match i64::try_from(core.total_samples) {
+                    Ok(value) if value != 0 => value,
+                    Ok(_) | Err(_) => 1,
+                };
+                core.sample_sum / total_samples
+            };
+            format!(
+                "samples={} dc_offset={} clip_ppm={} peak={} min={} max={} fs_steps={}",
+                core.total_samples,
+                dc_offset,
+                core.clipping_ppm(),
+                core.peak_abs_sample,
+                core.min_sample,
+                core.max_sample,
+                core.frame_sequencer_steps,
+            )
+        } else {
+            String::from("disabled")
+        };
+
+        let backend_summary = if let Some(info) = backend {
+            format!(
+                "mode={:?} src_hz={} out_hz={} ratio_ppm={} channels={} req_delta_sps={}",
+                info.resampler_mode,
+                info.source_rate_hz,
+                info.output_rate_hz,
+                info.resampler_ratio_ppm(),
+                info.channels,
+                callback_rate_delta,
+            )
+        } else {
+            String::from("unavailable")
         };
 
         eprintln!(
-            "audio diag: core(samples={},dc_offset={},clip_ppm={},amp_buckets={:?}) queue(queued={},dropped={}:+{},underflows={}:+{},callbacks={}:+{},enq_sps={},deq_sps={},req_sps={})",
-            core.total_samples,
-            dc_offset,
-            clipping_ppm,
-            core.amplitude_buckets,
+            "audio diag: core({}) queue(queued={},dropped={}:+{},underflows={}:+{},silence_fill={}:+{},callbacks={}:+{},callback_req_min={},callback_req_max={},enq_sps={},deq_sps={},req_sps={}) backend({})",
+            core_summary,
             queue.queued_samples,
             queue.dropped_samples,
             dropped_delta,
             queue.underflow_events,
             underflow_delta,
+            queue.underflow_silence_samples,
+            underflow_silence_delta,
             queue.callback_calls,
             callback_delta,
+            queue.callback_min_requested_samples,
+            queue.callback_max_requested_samples,
             enqueued_rate,
             dequeued_rate,
             callback_rate,
+            backend_summary,
         );
 
         self.last_audio_diag_report = now;
         self.last_audio_diag_checkpoint = Some(current);
-    }
-}
-
-fn parts_per_million(numerator: u64, denominator: u64) -> u64 {
-    if denominator == 0 {
-        return 0;
-    }
-    let scaled = (u128::from(numerator) * 1_000_000u128) / u128::from(denominator);
-    match u64::try_from(scaled) {
-        Ok(value) => value,
-        Err(_) => u64::MAX,
     }
 }
 

@@ -10,14 +10,46 @@ const CORE_SAMPLE_RATE_HZ: u32 = 48_000;
 const RESAMPLER_CHUNK_SAMPLES: usize = 2_048;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResamplerMode {
+    Bypass,
+    SampleHold,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioBackendDiagnostics {
+    pub source_rate_hz: u32,
+    pub output_rate_hz: u32,
+    pub channels: usize,
+    pub resampler_mode: ResamplerMode,
+}
+
+impl AudioBackendDiagnostics {
+    #[must_use]
+    pub fn resampler_ratio_ppm(self) -> u64 {
+        if self.output_rate_hz == 0 {
+            return 0;
+        }
+        let scaled =
+            (u128::from(self.source_rate_hz) * 1_000_000u128) / u128::from(self.output_rate_hz);
+        match u64::try_from(scaled) {
+            Ok(value) => value,
+            Err(_) => u64::MAX,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AudioStats {
     pub queued_samples: usize,
     pub dropped_samples: u64,
     pub underflow_events: u64,
+    pub underflow_silence_samples: u64,
     pub enqueued_samples: u64,
     pub dequeued_samples: u64,
     pub callback_requested_samples: u64,
     pub callback_calls: u64,
+    pub callback_min_requested_samples: usize,
+    pub callback_max_requested_samples: usize,
 }
 
 #[derive(Debug)]
@@ -26,10 +58,13 @@ struct AudioQueueState {
     max_samples: usize,
     dropped_samples: u64,
     underflow_events: u64,
+    underflow_silence_samples: u64,
     enqueued_samples: u64,
     dequeued_samples: u64,
     callback_requested_samples: u64,
     callback_calls: u64,
+    callback_min_requested_samples: Option<usize>,
+    callback_max_requested_samples: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -46,10 +81,13 @@ impl AudioQueue {
                 max_samples,
                 dropped_samples: 0,
                 underflow_events: 0,
+                underflow_silence_samples: 0,
                 enqueued_samples: 0,
                 dequeued_samples: 0,
                 callback_requested_samples: 0,
                 callback_calls: 0,
+                callback_min_requested_samples: None,
+                callback_max_requested_samples: 0,
             })),
         }
     }
@@ -126,6 +164,9 @@ impl AudioQueue {
 
         if available < output.len() {
             state.underflow_events = state.underflow_events.wrapping_add(1);
+            state.underflow_silence_samples = state
+                .underflow_silence_samples
+                .wrapping_add(usize_to_u64(output.len().saturating_sub(available)));
         }
     }
 
@@ -138,6 +179,13 @@ impl AudioQueue {
         state.callback_requested_samples = state
             .callback_requested_samples
             .wrapping_add(usize_to_u64(requested_samples));
+        state.callback_min_requested_samples = Some(
+            state
+                .callback_min_requested_samples
+                .map_or(requested_samples, |current| current.min(requested_samples)),
+        );
+        state.callback_max_requested_samples =
+            state.callback_max_requested_samples.max(requested_samples);
     }
 
     #[must_use]
@@ -147,10 +195,13 @@ impl AudioQueue {
                 queued_samples: 0,
                 dropped_samples: 0,
                 underflow_events: 0,
+                underflow_silence_samples: 0,
                 enqueued_samples: 0,
                 dequeued_samples: 0,
                 callback_requested_samples: 0,
                 callback_calls: 0,
+                callback_min_requested_samples: 0,
+                callback_max_requested_samples: 0,
             };
         };
 
@@ -158,16 +209,20 @@ impl AudioQueue {
             queued_samples: state.queue.len(),
             dropped_samples: state.dropped_samples,
             underflow_events: state.underflow_events,
+            underflow_silence_samples: state.underflow_silence_samples,
             enqueued_samples: state.enqueued_samples,
             dequeued_samples: state.dequeued_samples,
             callback_requested_samples: state.callback_requested_samples,
             callback_calls: state.callback_calls,
+            callback_min_requested_samples: state.callback_min_requested_samples.unwrap_or(0),
+            callback_max_requested_samples: state.callback_max_requested_samples,
         }
     }
 }
 
 pub struct AudioBackend {
     _stream: Stream,
+    diagnostics: AudioBackendDiagnostics,
 }
 
 impl AudioBackend {
@@ -186,14 +241,18 @@ impl AudioBackend {
         let channels = usize::from(default_config.channels()).max(1);
         let default_stream_config: StreamConfig = default_config.config();
 
-        let stream = if default_stream_config.sample_rate.0 == CORE_SAMPLE_RATE_HZ {
-            build_stream(
-                &device,
-                default_config.sample_format(),
-                &default_stream_config,
-                channels,
-                queue.clone(),
-            )?
+        let (stream, output_rate_hz) = if default_stream_config.sample_rate.0 == CORE_SAMPLE_RATE_HZ
+        {
+            (
+                build_stream(
+                    &device,
+                    default_config.sample_format(),
+                    &default_stream_config,
+                    channels,
+                    queue.clone(),
+                )?,
+                default_stream_config.sample_rate.0,
+            )
         } else {
             let mut preferred_stream_config = default_stream_config.clone();
             preferred_stream_config.sample_rate = SampleRate(CORE_SAMPLE_RATE_HZ);
@@ -205,22 +264,43 @@ impl AudioBackend {
                 channels,
                 queue.clone(),
             ) {
-                Ok(stream) => stream,
+                Ok(stream) => (stream, preferred_stream_config.sample_rate.0),
                 Err(DesktopError::AudioStreamBuild(
                     cpal::BuildStreamError::StreamConfigNotSupported,
-                )) => build_stream(
-                    &device,
-                    default_config.sample_format(),
-                    &default_stream_config,
-                    channels,
-                    queue.clone(),
-                )?,
+                )) => (
+                    build_stream(
+                        &device,
+                        default_config.sample_format(),
+                        &default_stream_config,
+                        channels,
+                        queue.clone(),
+                    )?,
+                    default_stream_config.sample_rate.0,
+                ),
                 Err(err) => return Err(err),
             }
         };
 
         stream.play().map_err(DesktopError::AudioStreamPlay)?;
-        Ok(Some(Self { _stream: stream }))
+        let diagnostics = AudioBackendDiagnostics {
+            source_rate_hz: CORE_SAMPLE_RATE_HZ,
+            output_rate_hz,
+            channels,
+            resampler_mode: if output_rate_hz == CORE_SAMPLE_RATE_HZ {
+                ResamplerMode::Bypass
+            } else {
+                ResamplerMode::SampleHold
+            },
+        };
+        Ok(Some(Self {
+            _stream: stream,
+            diagnostics,
+        }))
+    }
+
+    #[must_use]
+    pub fn diagnostics(&self) -> AudioBackendDiagnostics {
+        self.diagnostics
     }
 }
 
@@ -485,7 +565,27 @@ mod tests {
         write_i16_data(&mut out, 2, &queue, &mut resampler);
         assert_eq!(out, [10, -10, 20, -20, 0, 0]);
         assert_eq!(queue.stats().underflow_events, 1);
+        assert_eq!(queue.stats().underflow_silence_samples, 2_044);
         assert_eq!(queue.stats().callback_requested_samples, 6);
+        assert_eq!(queue.stats().callback_min_requested_samples, 6);
+        assert_eq!(queue.stats().callback_max_requested_samples, 6);
+    }
+
+    #[test]
+    fn callback_request_bounds_track_min_and_max() {
+        let queue = AudioQueue::new(16);
+        queue.enqueue(&[1, 1, 2, 2, 3, 3, 4, 4]);
+
+        let mut resampler = StereoResampler::new(48_000, 48_000);
+        let mut first = [0i16; 4];
+        write_i16_data(&mut first, 2, &queue, &mut resampler);
+
+        let mut second = [0i16; 8];
+        write_i16_data(&mut second, 2, &queue, &mut resampler);
+
+        let stats = queue.stats();
+        assert_eq!(stats.callback_min_requested_samples, 4);
+        assert_eq!(stats.callback_max_requested_samples, 8);
     }
 
     #[test]

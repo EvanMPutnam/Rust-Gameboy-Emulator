@@ -36,7 +36,7 @@ fn main() {
         Err(err) => {
             eprintln!("{err}");
             eprintln!(
-                "usage: --rom <path> [--boot-rom <path>] (--cycles <n> | --frames <n>) [--input-script <path>] [--save-in <path>] [--save-out <path>]"
+                "usage: --rom <path> [--boot-rom <path>] (--cycles <n> | --frames <n>) [--input-script <path>] [--save-in <path>] [--save-out <path>] [--audio-diagnostics] [--audio-channel-diagnostics]"
             );
             eprintln!("   or: --compat-tier <smoke|core|full> [--manifest <path>]");
             std::process::exit(2);
@@ -61,44 +61,60 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
     let mut input_script_path = None;
     let mut save_in_path = None;
     let mut save_out_path = None;
+    let mut audio_diagnostics = false;
+    let mut audio_channel_diagnostics = false;
     let mut compat_tier = None;
     let mut compat_manifest = None;
 
     let mut index = 0usize;
     while index < args.len() {
         let key = &args[index];
-        let Some(value) = args.get(index + 1) else {
-            return Err(format!("missing value for argument '{key}'"));
-        };
-
         match key.as_str() {
-            "--rom" => rom_path = Some(PathBuf::from(value)),
-            "--boot-rom" => boot_rom_path = Some(PathBuf::from(value)),
-            "--cycles" => {
-                cycles = Some(
-                    value
-                        .parse::<u32>()
-                        .map_err(|_| format!("invalid cycle count '{value}'"))?,
-                );
+            "--audio-diagnostics" => {
+                audio_diagnostics = true;
+                index += 1;
             }
-            "--frames" => {
-                frames = Some(
-                    value
-                        .parse::<u32>()
-                        .map_err(|_| format!("invalid frame count '{value}'"))?,
-                );
+            "--audio-channel-diagnostics" => {
+                audio_channel_diagnostics = true;
+                audio_diagnostics = true;
+                index += 1;
             }
-            "--input-script" => input_script_path = Some(PathBuf::from(value)),
-            "--save-in" => save_in_path = Some(PathBuf::from(value)),
-            "--save-out" => save_out_path = Some(PathBuf::from(value)),
-            "--compat-tier" => {
-                compat_tier = Some(CompatTier::from_str(value).map_err(|err| format!("{err}"))?);
+            "--rom" | "--boot-rom" | "--cycles" | "--frames" | "--input-script" | "--save-in"
+            | "--save-out" | "--compat-tier" | "--manifest" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err(format!("missing value for argument '{key}'"));
+                };
+                match key.as_str() {
+                    "--rom" => rom_path = Some(PathBuf::from(value)),
+                    "--boot-rom" => boot_rom_path = Some(PathBuf::from(value)),
+                    "--input-script" => input_script_path = Some(PathBuf::from(value)),
+                    "--save-in" => save_in_path = Some(PathBuf::from(value)),
+                    "--save-out" => save_out_path = Some(PathBuf::from(value)),
+                    "--compat-tier" => {
+                        compat_tier =
+                            Some(CompatTier::from_str(value).map_err(|err| format!("{err}"))?);
+                    }
+                    "--manifest" => compat_manifest = Some(PathBuf::from(value)),
+                    "--cycles" => {
+                        cycles = Some(
+                            value
+                                .parse::<u32>()
+                                .map_err(|_| format!("invalid cycle count '{value}'"))?,
+                        );
+                    }
+                    "--frames" => {
+                        frames = Some(
+                            value
+                                .parse::<u32>()
+                                .map_err(|_| format!("invalid frame count '{value}'"))?,
+                        );
+                    }
+                    _ => {}
+                }
+                index += 2;
             }
-            "--manifest" => compat_manifest = Some(PathBuf::from(value)),
             _ => return Err(format!("unknown argument '{key}'")),
         }
-
-        index += 2;
     }
 
     if let Some(tier) = compat_tier {
@@ -127,6 +143,8 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
         input_script_path,
         save_in_path,
         save_out_path,
+        audio_diagnostics,
+        audio_channel_diagnostics,
     }))
 }
 
@@ -156,6 +174,27 @@ mod tests {
         match command {
             Command::Single(config) => {
                 assert_eq!(config.budget, RunBudget::Cycles(100));
+            }
+            Command::Compat { .. } => panic!("expected single command"),
+        }
+    }
+
+    #[test]
+    fn parse_args_accepts_audio_diagnostics_flags() {
+        let args = vec![
+            String::from("--rom"),
+            String::from("game.gb"),
+            String::from("--frames"),
+            String::from("10"),
+            String::from("--audio-diagnostics"),
+            String::from("--audio-channel-diagnostics"),
+        ];
+        let command = parse_args(&args).expect("parse args");
+
+        match command {
+            Command::Single(config) => {
+                assert!(config.audio_diagnostics);
+                assert!(config.audio_channel_diagnostics);
             }
             Command::Compat { .. } => panic!("expected single command"),
         }

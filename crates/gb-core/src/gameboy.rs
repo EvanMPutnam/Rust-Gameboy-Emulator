@@ -1,5 +1,5 @@
 use crate::Cycles;
-use crate::apu::Apu;
+use crate::apu::{Apu, ApuDiagnostics};
 use crate::bus::Bus;
 use crate::cartridge::Cartridge;
 use crate::cartridge::save::CartridgeSave;
@@ -182,6 +182,16 @@ impl GameBoy {
 
     pub fn set_ppu_diagnostics_enabled(&mut self, enabled: bool) {
         self.ppu.set_diagnostics_enabled(enabled);
+    }
+
+    pub fn set_apu_diagnostics_enabled(&mut self, enabled: bool, include_channel_stats: bool) {
+        self.apu
+            .set_diagnostics_enabled(enabled, include_channel_stats);
+    }
+
+    #[must_use]
+    pub fn apu_diagnostics(&self) -> Option<ApuDiagnostics> {
+        self.apu.diagnostics()
     }
 
     #[must_use]

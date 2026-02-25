@@ -56,6 +56,8 @@ fn run_entry(entry: &ManifestRom) -> CompatRomResult {
         input_script_path: None,
         save_in_path: None,
         save_out_path: None,
+        audio_diagnostics: false,
+        audio_channel_diagnostics: false,
     };
 
     let (outcome, cycles_executed, frame_hash, audio_hash, failure_category, diagnostic) =

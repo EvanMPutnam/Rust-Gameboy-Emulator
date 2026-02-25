@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 const CPU_HZ: u64 = 4_194_304;
 const FRAME_SEQUENCER_PERIOD: Cycles = 8_192;
 const SAMPLE_RATE: u64 = 48_000;
-const MIX_OUTPUT_GAIN: i32 = 64;
+const MIX_OUTPUT_GAIN: i32 = 48;
+const HPF_SHIFT: u32 = 11;
+const FNV64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV64_PRIME: u64 = 0x0000_0001_0000_01B3;
 const DUTY_TABLE: [[u8; 8]; 4] = [
     [0, 0, 0, 0, 0, 0, 0, 1],
     [1, 0, 0, 0, 0, 0, 0, 1],
@@ -26,6 +29,7 @@ struct FrameEvents {
     clock_length: bool,
     clock_sweep: bool,
     clock_envelope: bool,
+    sequencer_steps: u8,
 }
 
 impl FrameSequencer {
@@ -36,6 +40,7 @@ impl FrameSequencer {
         while self.cycles >= FRAME_SEQUENCER_PERIOD {
             self.cycles -= FRAME_SEQUENCER_PERIOD;
             self.step = (self.step + 1) & 0x07;
+            events.sequencer_steps = events.sequencer_steps.wrapping_add(1);
 
             events.clock_length = events.clock_length || matches!(self.step, 0 | 2 | 4 | 6);
             events.clock_sweep = events.clock_sweep || self.step == 2 || self.step == 6;
@@ -406,6 +411,186 @@ impl NoiseChannel {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApuChannelDiagnostics {
+    pub sample_count: u64,
+    pub sample_sum: i64,
+    pub sample_abs_sum: u64,
+    pub peak_abs_sample: u16,
+    pub non_zero_samples: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApuDiagnostics {
+    pub total_samples: u64,
+    pub clipped_samples: u64,
+    pub sample_sum: i64,
+    pub sample_abs_sum: u64,
+    pub min_sample: i16,
+    pub max_sample: i16,
+    pub peak_abs_sample: u16,
+    pub frame_sequencer_steps: u64,
+    pub sample_hash: u64,
+    pub channel_stats: Option<[ApuChannelDiagnostics; 4]>,
+}
+
+impl Default for ApuDiagnostics {
+    fn default() -> Self {
+        Self {
+            total_samples: 0,
+            clipped_samples: 0,
+            sample_sum: 0,
+            sample_abs_sum: 0,
+            min_sample: 0,
+            max_sample: 0,
+            peak_abs_sample: 0,
+            frame_sequencer_steps: 0,
+            sample_hash: FNV64_OFFSET_BASIS,
+            channel_stats: None,
+        }
+    }
+}
+
+impl ApuDiagnostics {
+    #[must_use]
+    pub fn clipping_ppm(self) -> u64 {
+        if self.total_samples == 0 {
+            return 0;
+        }
+        let scaled =
+            (u128::from(self.clipped_samples) * 1_000_000u128) / u128::from(self.total_samples);
+        match u64::try_from(scaled) {
+            Ok(value) => value,
+            Err(_) => u64::MAX,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ApuDiagnosticsState {
+    include_channel_stats: bool,
+    total_samples: u64,
+    clipped_samples: u64,
+    sample_sum: i64,
+    sample_abs_sum: u64,
+    min_sample: i16,
+    max_sample: i16,
+    peak_abs_sample: u16,
+    frame_sequencer_steps: u64,
+    sample_hash: u64,
+    channel_stats: [ApuChannelDiagnostics; 4],
+}
+
+impl ApuDiagnosticsState {
+    fn new(include_channel_stats: bool) -> Self {
+        Self {
+            include_channel_stats,
+            total_samples: 0,
+            clipped_samples: 0,
+            sample_sum: 0,
+            sample_abs_sum: 0,
+            min_sample: 0,
+            max_sample: 0,
+            peak_abs_sample: 0,
+            frame_sequencer_steps: 0,
+            sample_hash: FNV64_OFFSET_BASIS,
+            channel_stats: [ApuChannelDiagnostics::default(); 4],
+        }
+    }
+
+    fn observe_frame_sequencer_steps(&mut self, steps: u8) {
+        self.frame_sequencer_steps = self.frame_sequencer_steps.wrapping_add(u64::from(steps));
+    }
+
+    fn observe_channels(&mut self, channels: [i16; 4]) {
+        if !self.include_channel_stats {
+            return;
+        }
+
+        for (stats, sample) in self.channel_stats.iter_mut().zip(channels) {
+            stats.sample_count = stats.sample_count.wrapping_add(1);
+            stats.sample_sum = stats.sample_sum.wrapping_add(i64::from(sample));
+
+            let abs = abs_sample_as_u16(sample);
+            stats.sample_abs_sum = stats.sample_abs_sum.wrapping_add(u64::from(abs));
+            stats.peak_abs_sample = stats.peak_abs_sample.max(abs);
+            if sample != 0 {
+                stats.non_zero_samples = stats.non_zero_samples.wrapping_add(1);
+            }
+        }
+    }
+
+    fn observe_stereo_output(&mut self, left: i16, right: i16, clipped_sides: u8) {
+        self.clipped_samples = self.clipped_samples.wrapping_add(u64::from(clipped_sides));
+        self.observe_sample(left);
+        self.observe_sample(right);
+    }
+
+    fn observe_sample(&mut self, sample: i16) {
+        self.total_samples = self.total_samples.wrapping_add(1);
+        self.sample_sum = self.sample_sum.wrapping_add(i64::from(sample));
+
+        let abs = abs_sample_as_u16(sample);
+        self.sample_abs_sum = self.sample_abs_sum.wrapping_add(u64::from(abs));
+        self.peak_abs_sample = self.peak_abs_sample.max(abs);
+
+        if self.total_samples == 1 {
+            self.min_sample = sample;
+            self.max_sample = sample;
+        } else {
+            self.min_sample = self.min_sample.min(sample);
+            self.max_sample = self.max_sample.max(sample);
+        }
+
+        for byte in sample.to_le_bytes() {
+            self.sample_hash ^= u64::from(byte);
+            self.sample_hash = self.sample_hash.wrapping_mul(FNV64_PRIME);
+        }
+    }
+
+    fn snapshot(&self) -> ApuDiagnostics {
+        ApuDiagnostics {
+            total_samples: self.total_samples,
+            clipped_samples: self.clipped_samples,
+            sample_sum: self.sample_sum,
+            sample_abs_sum: self.sample_abs_sum,
+            min_sample: self.min_sample,
+            max_sample: self.max_sample,
+            peak_abs_sample: self.peak_abs_sample,
+            frame_sequencer_steps: self.frame_sequencer_steps,
+            sample_hash: self.sample_hash,
+            channel_stats: if self.include_channel_stats {
+                Some(self.channel_stats)
+            } else {
+                None
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+struct DmgHighPassState {
+    left_dc_accum: i64,
+    right_dc_accum: i64,
+}
+
+impl DmgHighPassState {
+    fn apply(&mut self, left: i32, right: i32) -> (i32, i32) {
+        (
+            Self::apply_side(left, &mut self.left_dc_accum),
+            Self::apply_side(right, &mut self.right_dc_accum),
+        )
+    }
+
+    fn apply_side(input: i32, dc_accum: &mut i64) -> i32 {
+        *dc_accum = dc_accum
+            .wrapping_add(i64::from(input))
+            .wrapping_sub(*dc_accum >> HPF_SHIFT);
+        let dc_estimate = *dc_accum >> HPF_SHIFT;
+        saturating_i32_from_i64(i64::from(input).wrapping_sub(dc_estimate))
+    }
+}
+
 #[derive(Default, Serialize, Deserialize)]
 pub struct Apu {
     enabled: bool,
@@ -416,13 +601,35 @@ pub struct Apu {
     ch3: WaveChannel,
     ch4: NoiseChannel,
     sample_accum: u64,
+    hpf: DmgHighPassState,
     sample_buffer: Vec<i16>,
+    diagnostics: Option<ApuDiagnosticsState>,
 }
 
 impl Apu {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn set_diagnostics_enabled(&mut self, enabled: bool, include_channel_stats: bool) {
+        if !enabled {
+            self.diagnostics = None;
+            return;
+        }
+
+        let reuse_existing = self
+            .diagnostics
+            .as_ref()
+            .is_some_and(|state| state.include_channel_stats == include_channel_stats);
+        if !reuse_existing {
+            self.diagnostics = Some(ApuDiagnosticsState::new(include_channel_stats));
+        }
+    }
+
+    #[must_use]
+    pub fn diagnostics(&self) -> Option<ApuDiagnostics> {
+        self.diagnostics.as_ref().map(ApuDiagnosticsState::snapshot)
     }
 
     pub fn tick(
@@ -469,11 +676,20 @@ impl Apu {
             .sample_accum
             .wrapping_add(u64::from(cycles).wrapping_mul(SAMPLE_RATE));
 
+        if let Some(diagnostics) = self.diagnostics.as_mut() {
+            diagnostics.observe_frame_sequencer_steps(events.sequencer_steps);
+        }
+
         while self.sample_accum >= CPU_HZ {
             self.sample_accum -= CPU_HZ;
-            let (left, right) = self.mix(io);
+            let (left, right, channels, clipped_sides) = self.mix(io);
             self.sample_buffer.push(left);
             self.sample_buffer.push(right);
+
+            if let Some(diagnostics) = self.diagnostics.as_mut() {
+                diagnostics.observe_channels(channels);
+                diagnostics.observe_stereo_output(left, right, clipped_sides);
+            }
         }
 
         self.update_nr52_status(io);
@@ -515,6 +731,7 @@ impl Apu {
         self.ch3 = WaveChannel::default();
         self.ch4 = NoiseChannel::default();
         self.sample_accum = 0;
+        self.hpf = DmgHighPassState::default();
         self.sample_buffer.clear();
 
         for register in io.iter_mut().take(0x26).skip(0x10) {
@@ -636,19 +853,19 @@ impl Apu {
             | (u8::from(self.ch4.enabled) << 3);
     }
 
-    fn mix(&self, io: &[u8; 0x80]) -> (i16, i16) {
-        let ch1 = self.ch1.output();
-        let ch2 = self.ch2.output();
-        let ch3 = self.ch3.output(io);
-        let ch4 = self.ch4.output();
-
+    fn mix(&mut self, io: &[u8; 0x80]) -> (i16, i16, [i16; 4], u8) {
+        let channels = [
+            self.ch1.output(),
+            self.ch2.output(),
+            self.ch3.output(io),
+            self.ch4.output(),
+        ];
         let nr50 = io[0x24];
         let nr51 = io[0x25];
 
         let mut left = 0i32;
         let mut right = 0i32;
 
-        let channels = [ch1, ch2, ch3, ch4];
         for (index, sample) in channels.iter().enumerate() {
             if (nr51 & (1 << index)) != 0 {
                 right += i32::from(*sample);
@@ -661,12 +878,14 @@ impl Apu {
         let left_vol = i32::from((nr50 >> 4) & 0x07) + 1;
         let right_vol = i32::from(nr50 & 0x07) + 1;
 
-        let left =
-            (left * left_vol * MIX_OUTPUT_GAIN).clamp(i32::from(i16::MIN), i32::from(i16::MAX));
-        let right =
-            (right * right_vol * MIX_OUTPUT_GAIN).clamp(i32::from(i16::MIN), i32::from(i16::MAX));
+        left = left * left_vol * MIX_OUTPUT_GAIN;
+        right = right * right_vol * MIX_OUTPUT_GAIN;
 
-        (i16_from_clamped_i32(left), i16_from_clamped_i32(right))
+        let (left, right) = self.hpf.apply(left, right);
+        let (left, left_clipped) = i16_from_i32_with_clipping(left);
+        let (right, right_clipped) = i16_from_i32_with_clipping(right);
+        let clipped_sides = u8::from(left_clipped) + u8::from(right_clipped);
+        (left, right, channels, clipped_sides)
     }
 }
 
@@ -696,11 +915,27 @@ fn noise_timer_period(divisor_code: u8, clock_shift: u8) -> i32 {
     }
 }
 
-fn i16_from_clamped_i32(value: i32) -> i16 {
+fn i16_from_i32_with_clipping(value: i32) -> (i16, bool) {
     match i16::try_from(value) {
-        Ok(sample) => sample,
-        Err(_) if value < 0 => i16::MIN,
-        Err(_) => i16::MAX,
+        Ok(sample) => (sample, false),
+        Err(_) if value < 0 => (i16::MIN, true),
+        Err(_) => (i16::MAX, true),
+    }
+}
+
+fn abs_sample_as_u16(sample: i16) -> u16 {
+    let abs = i32::from(sample).unsigned_abs();
+    match u16::try_from(abs) {
+        Ok(value) => value,
+        Err(_) => u16::MAX,
+    }
+}
+
+fn saturating_i32_from_i64(value: i64) -> i32 {
+    match i32::try_from(value) {
+        Ok(as_i32) => as_i32,
+        Err(_) if value < i64::from(i32::MIN) => i32::MIN,
+        Err(_) => i32::MAX,
     }
 }
 
@@ -741,8 +976,38 @@ mod tests {
         io[0x25] = 0xFF;
         io[0x30] = 0xFF;
 
-        let (left, right) = apu.mix(&io);
-        assert_eq!(left, 26_624);
-        assert_eq!(right, 26_624);
+        let (left, right, _, clipped_sides) = apu.mix(&io);
+        assert_eq!(left, 19_959);
+        assert_eq!(right, 19_959);
+        assert_eq!(clipped_sides, 0);
+    }
+
+    #[test]
+    fn diagnostics_are_opt_in_and_report_channel_stats() {
+        let mut apu = Apu::new();
+        let mut io = [0u8; 0x80];
+
+        io[0x26] = 0x80;
+        io[0x24] = 0x77;
+        io[0x25] = 0x11;
+        io[0x11] = 0xC0;
+        io[0x12] = 0xF3;
+        io[0x13] = 0x70;
+        io[0x14] = 0x80;
+
+        let write_mask = (1u128 << 0x11) | (1u128 << 0x12) | (1u128 << 0x13) | (1u128 << 0x14);
+        apu.tick(20_000, &mut io, write_mask)
+            .expect("tick should succeed");
+        assert!(apu.diagnostics().is_none());
+
+        apu.set_diagnostics_enabled(true, true);
+        io[0x14] = 0x80;
+        apu.tick(20_000, &mut io, 1u128 << 0x14)
+            .expect("tick should succeed");
+
+        let diagnostics = apu.diagnostics().expect("diagnostics should be available");
+        assert!(diagnostics.total_samples > 0);
+        assert!(diagnostics.frame_sequencer_steps > 0);
+        assert!(diagnostics.channel_stats.is_some());
     }
 }

@@ -2,6 +2,7 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
+use gb_core::apu::ApuDiagnostics;
 use gb_core::ppu::PpuFrameDiagnostics;
 use gb_core::{CartridgeSave, Cycles, GameBoy, GbConfig, GbError};
 
@@ -19,60 +20,9 @@ pub struct TickSummary {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CoreAudioDiagnostics {
-    pub total_samples: u64,
-    pub sample_sum: i64,
-    pub clipped_samples: u64,
-    pub amplitude_buckets: [u64; 5],
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AudioPipelineDiagnostics {
-    pub core: CoreAudioDiagnostics,
+    pub core: Option<ApuDiagnostics>,
     pub queue: AudioStats,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CoreAudioAccumulator {
-    total_samples: u64,
-    sample_sum: i64,
-    clipped_samples: u64,
-    amplitude_buckets: [u64; 5],
-}
-
-impl CoreAudioAccumulator {
-    fn observe(&mut self, samples: &[i16]) {
-        for &sample in samples {
-            self.total_samples = self.total_samples.wrapping_add(1);
-            self.sample_sum = self.sample_sum.wrapping_add(i64::from(sample));
-            if sample == i16::MIN || sample == i16::MAX {
-                self.clipped_samples = self.clipped_samples.wrapping_add(1);
-            }
-
-            let amplitude = i32::from(sample).abs();
-            let bucket = if amplitude == 0 {
-                0
-            } else if amplitude <= 1_023 {
-                1
-            } else if amplitude <= 4_095 {
-                2
-            } else if amplitude <= 16_383 {
-                3
-            } else {
-                4
-            };
-            self.amplitude_buckets[bucket] = self.amplitude_buckets[bucket].wrapping_add(1);
-        }
-    }
-
-    fn snapshot(self) -> CoreAudioDiagnostics {
-        CoreAudioDiagnostics {
-            total_samples: self.total_samples,
-            sample_sum: self.sample_sum,
-            clipped_samples: self.clipped_samples,
-            amplitude_buckets: self.amplitude_buckets,
-        }
-    }
 }
 
 pub struct DesktopApp {
@@ -80,7 +30,6 @@ pub struct DesktopApp {
     video: VideoPresenter,
     audio: AudioQueue,
     runloop: RunLoop,
-    audio_accumulator: CoreAudioAccumulator,
     audio_scratch: Vec<i16>,
     latest_ppu_diagnostics: Option<PpuFrameDiagnostics>,
 }
@@ -103,12 +52,6 @@ impl DesktopApp {
             video: VideoPresenter::new(),
             audio: AudioQueue::new(48_000),
             runloop: RunLoop::new(),
-            audio_accumulator: CoreAudioAccumulator {
-                total_samples: 0,
-                sample_sum: 0,
-                clipped_samples: 0,
-                amplitude_buckets: [0; 5],
-            },
             audio_scratch: Vec::new(),
             latest_ppu_diagnostics: None,
         })
@@ -174,7 +117,6 @@ impl DesktopApp {
         self.audio_scratch.clear();
         self.gameboy
             .drain_audio_samples_into(&mut self.audio_scratch);
-        self.audio_accumulator.observe(&self.audio_scratch);
         let audio_samples_enqueued = self.audio_scratch.len();
         self.audio.enqueue(&self.audio_scratch);
 
@@ -197,6 +139,11 @@ impl DesktopApp {
         }
     }
 
+    pub fn set_audio_diagnostics_enabled(&mut self, enabled: bool, include_channel_stats: bool) {
+        self.gameboy
+            .set_apu_diagnostics_enabled(enabled, include_channel_stats);
+    }
+
     #[must_use]
     pub fn total_cycles(&self) -> Cycles {
         self.gameboy.clock.now()
@@ -210,7 +157,7 @@ impl DesktopApp {
     #[must_use]
     pub fn audio_diagnostics(&self) -> AudioPipelineDiagnostics {
         AudioPipelineDiagnostics {
-            core: self.audio_accumulator.snapshot(),
+            core: self.gameboy.apu_diagnostics(),
             queue: self.audio.stats(),
         }
     }
