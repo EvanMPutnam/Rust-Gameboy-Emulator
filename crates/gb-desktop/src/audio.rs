@@ -56,6 +56,7 @@ pub struct AudioStats {
 struct AudioQueueState {
     queue: VecDeque<i16>,
     max_samples: usize,
+    muted: bool,
     dropped_samples: u64,
     underflow_events: u64,
     underflow_silence_samples: u64,
@@ -79,6 +80,7 @@ impl AudioQueue {
             inner: Arc::new(Mutex::new(AudioQueueState {
                 queue: VecDeque::new(),
                 max_samples,
+                muted: false,
                 dropped_samples: 0,
                 underflow_events: 0,
                 underflow_silence_samples: 0,
@@ -150,10 +152,11 @@ impl AudioQueue {
             return;
         };
 
+        let muted = state.muted;
         let available = state.queue.len().min(output.len());
         for slot in output.iter_mut().take(available) {
             if let Some(sample) = state.queue.pop_front() {
-                *slot = sample;
+                *slot = if muted { 0 } else { sample };
             }
         }
         for slot in output.iter_mut().skip(available) {
@@ -218,6 +221,21 @@ impl AudioQueue {
             callback_max_requested_samples: state.callback_max_requested_samples,
         }
     }
+
+    pub fn set_muted(&self, muted: bool) {
+        let Ok(mut state) = self.inner.lock() else {
+            return;
+        };
+        state.muted = muted;
+    }
+
+    #[must_use]
+    pub fn is_muted(&self) -> bool {
+        let Ok(state) = self.inner.lock() else {
+            return false;
+        };
+        state.muted
+    }
 }
 
 pub struct AudioBackend {
@@ -227,14 +245,15 @@ pub struct AudioBackend {
 
 impl AudioBackend {
     pub fn start(queue: &AudioQueue, muted: bool) -> Result<Option<Self>, DesktopError> {
+        queue.set_muted(muted);
         if muted {
             return Ok(None);
         }
 
         let host = cpal::default_host();
-        let device = host
-            .default_output_device()
-            .ok_or(DesktopError::AudioNoDevice)?;
+        let Some(device) = host.default_output_device() else {
+            return Err(DesktopError::AudioNoDevice);
+        };
         let default_config = device
             .default_output_config()
             .map_err(DesktopError::AudioDefaultConfig)?;
@@ -620,5 +639,19 @@ mod tests {
 
         assert_eq!(first, (100, 100));
         assert_eq!(second, (300, 300));
+    }
+
+    #[test]
+    fn muting_outputs_silence_while_draining_queue() {
+        let queue = AudioQueue::new(8);
+        queue.enqueue(&[11, -11, 22, -22]);
+        queue.set_muted(true);
+
+        let mut out = [0i16; 4];
+        queue.dequeue_into(&mut out);
+
+        assert_eq!(out, [0, 0, 0, 0]);
+        assert_eq!(queue.stats().queued_samples, 0);
+        assert!(queue.is_muted());
     }
 }

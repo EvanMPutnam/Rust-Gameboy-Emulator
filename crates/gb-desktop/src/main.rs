@@ -2,6 +2,7 @@ mod app;
 mod audio;
 mod error;
 mod input;
+mod menu;
 mod platform;
 mod runloop;
 mod video;

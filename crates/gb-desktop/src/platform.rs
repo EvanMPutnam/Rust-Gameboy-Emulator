@@ -8,13 +8,14 @@ use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use crate::app::DesktopApp;
 use crate::audio::AudioBackend;
 use crate::error::DesktopError;
 use crate::input::{HostInputEvent, HostKey};
+use crate::menu::{DesktopMenu, EmulationSpeed, MenuCommand};
 
 const DEFAULT_WINDOW_WIDTH: u32 = 1_280;
 const DEFAULT_WINDOW_HEIGHT: u32 = 720;
@@ -79,6 +80,7 @@ struct DesktopRuntime {
     snapshot_path: PathBuf,
     app: DesktopApp,
     audio_backend: Option<AudioBackend>,
+    menu: Option<DesktopMenu>,
     window: Option<Arc<Window>>,
     window_id: Option<WindowId>,
     pixels: Option<Pixels<'static>>,
@@ -86,6 +88,7 @@ struct DesktopRuntime {
     last_tick: Instant,
     last_audio_diag_report: Instant,
     last_audio_diag_checkpoint: Option<AudioDiagCheckpoint>,
+    modifiers: ModifiersState,
     pending_error: Option<DesktopError>,
 }
 
@@ -113,6 +116,7 @@ impl DesktopRuntime {
             snapshot_path,
             app,
             audio_backend: audio,
+            menu: None,
             window: None,
             window_id: None,
             pixels: None,
@@ -120,6 +124,7 @@ impl DesktopRuntime {
             last_tick: now,
             last_audio_diag_report: now,
             last_audio_diag_checkpoint: None,
+            modifiers: ModifiersState::default(),
             pending_error: None,
         }
     }
@@ -166,6 +171,12 @@ impl DesktopRuntime {
         self.window_id = Some(window.id());
         self.window = Some(window);
         self.pixels = Some(pixels);
+        if self.menu.is_none() {
+            self.menu = Some(DesktopMenu::install(
+                self.app.emulation_speed_multiplier(),
+                self.app.audio_muted(),
+            ));
+        }
         self.surface_size = size;
         self.app.resize(size.width.max(1), size.height.max(1));
         self.last_tick = Instant::now();
@@ -202,20 +213,20 @@ impl DesktopRuntime {
         };
 
         if state == ElementState::Pressed && !repeat {
+            if let Some(command) = self.command_for_accelerator(code) {
+                self.apply_menu_command(event_loop, command);
+                return;
+            }
             if code == KeyCode::Escape {
                 event_loop.exit();
                 return;
             }
             if code == KeyCode::F5 {
-                if let Err(err) = self.app.save_snapshot_to_path(&self.snapshot_path) {
-                    self.set_error(event_loop, err);
-                }
+                self.save_state(event_loop);
                 return;
             }
             if code == KeyCode::F9 {
-                if let Err(err) = self.app.load_snapshot_from_path(&self.snapshot_path) {
-                    self.set_error(event_loop, err);
-                }
+                self.load_state(event_loop);
                 return;
             }
         }
@@ -233,10 +244,97 @@ impl DesktopRuntime {
         }
     }
 
+    fn command_for_accelerator(&self, code: KeyCode) -> Option<MenuCommand> {
+        let primary_modifier_pressed = self.modifiers.super_key() || self.modifiers.control_key();
+        if primary_modifier_pressed {
+            return match code {
+                KeyCode::KeyS => Some(MenuCommand::SaveState),
+                KeyCode::KeyL => Some(MenuCommand::LoadState),
+                KeyCode::KeyM => Some(MenuCommand::ToggleMute),
+                KeyCode::Digit2 => Some(MenuCommand::SetEmulationSpeed(EmulationSpeed::X2)),
+                KeyCode::Digit4 => Some(MenuCommand::SetEmulationSpeed(EmulationSpeed::X4)),
+                KeyCode::Digit8 => Some(MenuCommand::SetEmulationSpeed(EmulationSpeed::X8)),
+                KeyCode::Digit6 => Some(MenuCommand::SetEmulationSpeed(EmulationSpeed::X16)),
+                _ => None,
+            };
+        }
+
+        match code {
+            KeyCode::F6 => Some(MenuCommand::SetEmulationSpeed(EmulationSpeed::X2)),
+            KeyCode::F7 => Some(MenuCommand::SetEmulationSpeed(EmulationSpeed::X4)),
+            KeyCode::F8 => Some(MenuCommand::SetEmulationSpeed(EmulationSpeed::X8)),
+            KeyCode::F10 => Some(MenuCommand::SetEmulationSpeed(EmulationSpeed::X16)),
+            _ => None,
+        }
+    }
+
+    fn save_state(&mut self, event_loop: &ActiveEventLoop) {
+        if let Err(err) = self.app.save_snapshot_to_path(&self.snapshot_path) {
+            self.set_error(event_loop, err);
+        }
+    }
+
+    fn load_state(&mut self, event_loop: &ActiveEventLoop) {
+        if let Err(err) = self.app.load_snapshot_from_path(&self.snapshot_path) {
+            self.set_error(event_loop, err);
+        }
+    }
+
+    fn handle_menu_commands(&mut self, event_loop: &ActiveEventLoop) {
+        let commands = self
+            .menu
+            .as_ref()
+            .map_or_else(Vec::new, |_| DesktopMenu::take_pending_commands());
+
+        for command in commands {
+            self.apply_menu_command(event_loop, command);
+            if self.pending_error.is_some() {
+                return;
+            }
+        }
+    }
+
+    fn apply_menu_command(&mut self, event_loop: &ActiveEventLoop, command: MenuCommand) {
+        match command {
+            MenuCommand::SaveState => self.save_state(event_loop),
+            MenuCommand::LoadState => self.load_state(event_loop),
+            MenuCommand::SetEmulationSpeed(speed) => {
+                self.app.set_emulation_speed_multiplier(speed.multiplier());
+                if let Some(menu) = self.menu.as_ref() {
+                    menu.set_emulation_speed(self.app.emulation_speed_multiplier());
+                }
+            }
+            MenuCommand::ToggleMute => {
+                let next_muted = !self.app.audio_muted();
+                self.app.set_audio_muted(next_muted);
+                if !next_muted && self.audio_backend.is_none() {
+                    let queue = self.app.audio_queue();
+                    match AudioBackend::start(&queue, false) {
+                        Ok(backend) => {
+                            self.audio_backend = backend;
+                        }
+                        Err(err) => {
+                            self.set_error(event_loop, err);
+                            return;
+                        }
+                    }
+                }
+                if let Some(menu) = self.menu.as_ref() {
+                    menu.set_muted(next_muted);
+                }
+            }
+        }
+    }
+
     fn step_and_render(&mut self, event_loop: &ActiveEventLoop) {
         let now = Instant::now();
         let elapsed = now.saturating_duration_since(self.last_tick);
         self.last_tick = now;
+
+        self.handle_menu_commands(event_loop);
+        if self.pending_error.is_some() {
+            return;
+        }
 
         if let Err(err) = self.app.tick(elapsed) {
             self.set_error(event_loop, DesktopError::Core(err));
@@ -513,6 +611,9 @@ impl ApplicationHandler for DesktopRuntime {
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 self.handle_keyboard(event_loop, event.state, event.repeat, event.physical_key);
+            }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.modifiers = modifiers.state();
             }
             WindowEvent::RedrawRequested => {
                 self.step_and_render(event_loop);

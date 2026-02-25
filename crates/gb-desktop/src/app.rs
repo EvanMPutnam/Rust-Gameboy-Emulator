@@ -154,6 +154,24 @@ impl DesktopApp {
         self.audio.clone()
     }
 
+    pub fn set_emulation_speed_multiplier(&mut self, multiplier: u32) {
+        self.runloop.set_speed_multiplier(multiplier);
+    }
+
+    #[must_use]
+    pub fn emulation_speed_multiplier(&self) -> u32 {
+        self.runloop.speed_multiplier()
+    }
+
+    pub fn set_audio_muted(&self, muted: bool) {
+        self.audio.set_muted(muted);
+    }
+
+    #[must_use]
+    pub fn audio_muted(&self) -> bool {
+        self.audio.is_muted()
+    }
+
     #[must_use]
     pub fn audio_diagnostics(&self) -> AudioPipelineDiagnostics {
         AudioPipelineDiagnostics {
@@ -243,5 +261,17 @@ mod tests {
         app.load_snapshot_from_path(&path).expect("load snapshot");
 
         std::fs::remove_file(path).expect("remove snapshot");
+    }
+
+    #[test]
+    fn runtime_controls_update_speed_and_mute_state() {
+        let mut app = DesktopApp::from_rom_bytes(test_rom(), None).expect("init app");
+        app.set_emulation_speed_multiplier(8);
+        assert_eq!(app.emulation_speed_multiplier(), 8);
+
+        app.set_audio_muted(true);
+        assert!(app.audio_muted());
+        app.set_audio_muted(false);
+        assert!(!app.audio_muted());
     }
 }
