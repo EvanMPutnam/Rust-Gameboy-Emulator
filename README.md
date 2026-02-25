@@ -116,6 +116,4 @@ cargo test --all-targets --all-features
 ```
 
 ## Future TODOs
-
-- Audio fidelity is improved but still not fully complete; additional DMG-accuracy tuning is planned.
 - Perform thourough tests of all additional run commands.
