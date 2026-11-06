@@ -39,12 +39,13 @@ impl FrameSequencer {
 
         while self.cycles >= FRAME_SEQUENCER_PERIOD {
             self.cycles -= FRAME_SEQUENCER_PERIOD;
-            self.step = (self.step + 1) & 0x07;
             events.sequencer_steps = events.sequencer_steps.wrapping_add(1);
 
+            // Run the current step, then advance: step 0 is the first one after power-on.
             events.clock_length = events.clock_length || matches!(self.step, 0 | 2 | 4 | 6);
             events.clock_sweep = events.clock_sweep || self.step == 2 || self.step == 6;
             events.clock_envelope = events.clock_envelope || self.step == 7;
+            self.step = (self.step + 1) & 0x07;
         }
 
         events
@@ -59,16 +60,24 @@ struct SweepUnit {
     negate: bool,
     enabled: bool,
     shadow_freq: u16,
+    #[serde(skip)]
+    negate_used: bool,
 }
 
 impl SweepUnit {
-    fn write_nr10(&mut self, value: u8) {
+    fn write_nr10(&mut self, value: u8, ch1: &mut SquareChannel) {
         self.period = (value >> 4) & 0x07;
-        self.negate = (value & 0x08) != 0;
+        let negate = (value & 0x08) != 0;
+        // Leaving negate mode after a negated calculation disables the channel.
+        if self.negate && !negate && self.negate_used {
+            ch1.enabled = false;
+        }
+        self.negate = negate;
         self.shift = value & 0x07;
     }
 
     fn trigger(&mut self, ch1: &mut SquareChannel) {
+        self.negate_used = false;
         self.shadow_freq = ch1.freq;
         self.counter = if self.period == 0 { 8 } else { self.period };
         self.enabled = self.period != 0 || self.shift != 0;
@@ -95,7 +104,7 @@ impl SweepUnit {
         }
 
         self.counter = if self.period == 0 { 8 } else { self.period };
-        if self.shift == 0 {
+        if self.period == 0 {
             return;
         }
 
@@ -103,6 +112,10 @@ impl SweepUnit {
         if next > 2_047 {
             self.enabled = false;
             ch1.enabled = false;
+            return;
+        }
+
+        if self.shift == 0 {
             return;
         }
 
@@ -116,9 +129,10 @@ impl SweepUnit {
         }
     }
 
-    fn calculate_next(self) -> u16 {
+    fn calculate_next(&mut self) -> u16 {
         let delta = self.shadow_freq >> self.shift;
         if self.negate {
+            self.negate_used = true;
             self.shadow_freq.checked_sub(delta).unwrap_or(2_048)
         } else {
             self.shadow_freq.wrapping_add(delta)
@@ -144,10 +158,13 @@ struct SquareChannel {
 }
 
 impl SquareChannel {
-    fn trigger(&mut self) {
+    fn trigger(&mut self, extra_length_clock: bool) {
         self.enabled = self.dac_enabled;
         if self.length_counter == 0 {
             self.length_counter = 64;
+            if self.length_enabled && extra_length_clock {
+                self.length_counter -= 1;
+            }
         }
         self.timer = square_timer_period(self.freq);
         self.duty_pos = 0;
@@ -237,10 +254,13 @@ struct WaveChannel {
 }
 
 impl WaveChannel {
-    fn trigger(&mut self) {
+    fn trigger(&mut self, extra_length_clock: bool) {
         self.enabled = self.dac_enabled;
         if self.length_counter == 0 {
             self.length_counter = 256;
+            if self.length_enabled && extra_length_clock {
+                self.length_counter -= 1;
+            }
         }
         self.timer = wave_timer_period(self.freq);
         self.position = 0;
@@ -329,10 +349,13 @@ impl Default for NoiseChannel {
 }
 
 impl NoiseChannel {
-    fn trigger(&mut self) {
+    fn trigger(&mut self, extra_length_clock: bool) {
         self.enabled = self.dac_enabled;
         if self.length_counter == 0 {
             self.length_counter = 64;
+            if self.length_enabled && extra_length_clock {
+                self.length_counter -= 1;
+            }
         }
         self.lfsr = 0x7FFF;
         self.current_volume = self.initial_volume;
@@ -723,6 +746,13 @@ impl Apu {
     }
 
     fn power_off(&mut self, io: &mut [u8; 0x80]) {
+        // DMG length counters survive power-off.
+        let lengths = [
+            self.ch1.length_counter,
+            self.ch2.length_counter,
+            self.ch3.length_counter,
+            self.ch4.length_counter,
+        ];
         self.enabled = false;
         self.frame_seq = FrameSequencer::default();
         self.ch1_sweep = SweepUnit::default();
@@ -730,6 +760,10 @@ impl Apu {
         self.ch2 = SquareChannel::default();
         self.ch3 = WaveChannel::default();
         self.ch4 = NoiseChannel::default();
+        self.ch1.length_counter = lengths[0];
+        self.ch2.length_counter = lengths[1];
+        self.ch3.length_counter = lengths[2];
+        self.ch4.length_counter = lengths[3];
         self.sample_accum = 0;
         self.hpf = DmgHighPassState::default();
         self.sample_buffer.clear();
@@ -750,6 +784,19 @@ impl Apu {
         }
 
         if !self.enabled {
+            // DMG still accepts length writes while powered off.
+            if write_mask_has(write_mask, 0x11) {
+                self.ch1.length_counter = 64 - u16::from(io[0x11] & 0x3F);
+            }
+            if write_mask_has(write_mask, 0x16) {
+                self.ch2.length_counter = 64 - u16::from(io[0x16] & 0x3F);
+            }
+            if write_mask_has(write_mask, 0x1B) {
+                self.ch3.length_counter = 256 - u16::from(io[0x1B]);
+            }
+            if write_mask_has(write_mask, 0x20) {
+                self.ch4.length_counter = 64 - u16::from(io[0x20] & 0x3F);
+            }
             for index in 0x10u8..0x26 {
                 if write_mask_has(write_mask, index) {
                     io[usize::from(index)] = 0;
@@ -758,8 +805,11 @@ impl Apu {
             return;
         }
 
+        // The extra clock applies when the next sequencer step won't clock length.
+        let extra_length_clock = (self.frame_seq.step & 1) != 0;
+
         if write_mask_has(write_mask, 0x10) {
-            self.ch1_sweep.write_nr10(io[0x10]);
+            self.ch1_sweep.write_nr10(io[0x10], &mut self.ch1);
         }
         if write_mask_has(write_mask, 0x11) {
             self.ch1.duty = (io[0x11] >> 6) & 0x03;
@@ -772,10 +822,18 @@ impl Apu {
             self.ch1.freq = (self.ch1.freq & 0x0700) | u16::from(io[0x13]);
         }
         if write_mask_has(write_mask, 0x14) {
-            self.ch1.length_enabled = (io[0x14] & 0x40) != 0;
+            let triggering = (io[0x14] & 0x80) != 0;
+            write_length_enable(
+                &mut self.ch1.length_counter,
+                &mut self.ch1.length_enabled,
+                &mut self.ch1.enabled,
+                (io[0x14] & 0x40) != 0,
+                triggering,
+                extra_length_clock,
+            );
             self.ch1.freq = (self.ch1.freq & 0x00FF) | (u16::from(io[0x14] & 0x07) << 8);
-            if (io[0x14] & 0x80) != 0 {
-                self.ch1.trigger();
+            if triggering {
+                self.ch1.trigger(extra_length_clock);
                 self.ch1_sweep.trigger(&mut self.ch1);
                 io[0x14] &= 0x7F;
             }
@@ -792,10 +850,18 @@ impl Apu {
             self.ch2.freq = (self.ch2.freq & 0x0700) | u16::from(io[0x18]);
         }
         if write_mask_has(write_mask, 0x19) {
-            self.ch2.length_enabled = (io[0x19] & 0x40) != 0;
+            let triggering = (io[0x19] & 0x80) != 0;
+            write_length_enable(
+                &mut self.ch2.length_counter,
+                &mut self.ch2.length_enabled,
+                &mut self.ch2.enabled,
+                (io[0x19] & 0x40) != 0,
+                triggering,
+                extra_length_clock,
+            );
             self.ch2.freq = (self.ch2.freq & 0x00FF) | (u16::from(io[0x19] & 0x07) << 8);
-            if (io[0x19] & 0x80) != 0 {
-                self.ch2.trigger();
+            if triggering {
+                self.ch2.trigger(extra_length_clock);
                 io[0x19] &= 0x7F;
             }
         }
@@ -816,10 +882,18 @@ impl Apu {
             self.ch3.freq = (self.ch3.freq & 0x0700) | u16::from(io[0x1D]);
         }
         if write_mask_has(write_mask, 0x1E) {
-            self.ch3.length_enabled = (io[0x1E] & 0x40) != 0;
+            let triggering = (io[0x1E] & 0x80) != 0;
+            write_length_enable(
+                &mut self.ch3.length_counter,
+                &mut self.ch3.length_enabled,
+                &mut self.ch3.enabled,
+                (io[0x1E] & 0x40) != 0,
+                triggering,
+                extra_length_clock,
+            );
             self.ch3.freq = (self.ch3.freq & 0x00FF) | (u16::from(io[0x1E] & 0x07) << 8);
-            if (io[0x1E] & 0x80) != 0 {
-                self.ch3.trigger();
+            if triggering {
+                self.ch3.trigger(extra_length_clock);
                 io[0x1E] &= 0x7F;
             }
         }
@@ -836,9 +910,17 @@ impl Apu {
             self.ch4.divisor_code = io[0x22] & 0x07;
         }
         if write_mask_has(write_mask, 0x23) {
-            self.ch4.length_enabled = (io[0x23] & 0x40) != 0;
-            if (io[0x23] & 0x80) != 0 {
-                self.ch4.trigger();
+            let triggering = (io[0x23] & 0x80) != 0;
+            write_length_enable(
+                &mut self.ch4.length_counter,
+                &mut self.ch4.length_enabled,
+                &mut self.ch4.enabled,
+                (io[0x23] & 0x40) != 0,
+                triggering,
+                extra_length_clock,
+            );
+            if triggering {
+                self.ch4.trigger(extra_length_clock);
                 io[0x23] &= 0x7F;
             }
         }
@@ -936,6 +1018,26 @@ fn saturating_i32_from_i64(value: i64) -> i32 {
         Ok(as_i32) => as_i32,
         Err(_) if value < i64::from(i32::MIN) => i32::MIN,
         Err(_) => i32::MAX,
+    }
+}
+
+/// Applies the length-enable bit of an `NRx4` write. Enabling length while the
+/// next frame sequencer step won't clock it clocks the counter once now.
+fn write_length_enable(
+    length_counter: &mut u16,
+    length_enabled: &mut bool,
+    channel_enabled: &mut bool,
+    enable: bool,
+    triggering: bool,
+    extra_length_clock: bool,
+) {
+    let was_enabled = *length_enabled;
+    *length_enabled = enable;
+    if extra_length_clock && !was_enabled && enable && *length_counter > 0 {
+        *length_counter -= 1;
+        if *length_counter == 0 && !triggering {
+            *channel_enabled = false;
+        }
     }
 }
 

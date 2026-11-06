@@ -29,12 +29,9 @@ impl Timers {
         }
     }
 
+    /// Loads TIMA, TMA and TAC from the bus. DIV is not loaded: any write
+    /// resets it, which callers signal through `write_div`.
     pub fn apply_bus_regs(&mut self, regs: TimerRegs) {
-        let [div, _] = self.div_counter.to_be_bytes();
-        if regs.div != div {
-            self.write_div();
-        }
-
         self.tima = regs.tima;
         self.tma = regs.tma;
         self.tac = regs.tac & 0x07;
@@ -68,7 +65,7 @@ impl Timers {
         }
     }
 
-    fn write_div(&mut self) {
+    pub fn write_div(&mut self) {
         self.div_counter = 0;
         self.tima_counter = 0;
     }

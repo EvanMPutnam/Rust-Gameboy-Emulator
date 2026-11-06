@@ -1,5 +1,6 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmulationSpeed {
+    X1,
     X2,
     X4,
     X8,
@@ -10,6 +11,7 @@ impl EmulationSpeed {
     #[must_use]
     pub const fn multiplier(self) -> u32 {
         match self {
+            Self::X1 => 1,
             Self::X2 => 2,
             Self::X4 => 4,
             Self::X8 => 8,
@@ -20,6 +22,7 @@ impl EmulationSpeed {
     #[must_use]
     pub const fn from_multiplier(multiplier: u32) -> Option<Self> {
         match multiplier {
+            1 => Some(Self::X1),
             2 => Some(Self::X2),
             4 => Some(Self::X4),
             8 => Some(Self::X8),
@@ -87,6 +90,11 @@ mod imp {
             #[method(loadState:)]
             fn load_state(&self, _sender: &AnyObject) {
                 enqueue_command(MenuCommand::LoadState);
+            }
+
+            #[method(setSpeed1x:)]
+            fn set_speed_1x(&self, _sender: &AnyObject) {
+                enqueue_command(MenuCommand::SetEmulationSpeed(EmulationSpeed::X1));
             }
 
             #[method(setSpeed2x:)]
@@ -170,11 +178,35 @@ mod imp {
     struct DesktopMenuInner {
         _action_target: Retained<MenuActionTarget>,
         _menubar: Retained<NSMenu>,
-        speed_2x: Retained<NSMenuItem>,
-        speed_4x: Retained<NSMenuItem>,
-        speed_8x: Retained<NSMenuItem>,
-        speed_16x: Retained<NSMenuItem>,
+        speed_items: [(EmulationSpeed, Retained<NSMenuItem>); 5],
         mute_toggle: Retained<NSMenuItem>,
+    }
+
+    fn build_speed_menu(
+        mtm: MainThreadMarker,
+        target: &AnyObject,
+    ) -> (
+        Retained<NSMenuItem>,
+        [(EmulationSpeed, Retained<NSMenuItem>); 5],
+    ) {
+        let root = NSMenuItem::new(mtm);
+        set_title(&root, ns_string!("Emulation Speed"));
+        let menu = NSMenu::new(mtm);
+        root.setSubmenu(Some(&menu));
+
+        let items = [
+            (EmulationSpeed::X1, ns_string!("1x"), sel!(setSpeed1x:)),
+            (EmulationSpeed::X2, ns_string!("2x"), sel!(setSpeed2x:)),
+            (EmulationSpeed::X4, ns_string!("4x"), sel!(setSpeed4x:)),
+            (EmulationSpeed::X8, ns_string!("8x"), sel!(setSpeed8x:)),
+            (EmulationSpeed::X16, ns_string!("16x"), sel!(setSpeed16x:)),
+        ]
+        .map(|(speed, title, selector)| {
+            let item = action_item(mtm, title, selector, target, None, None);
+            menu.addItem(&item);
+            (speed, item)
+        });
+        (root, items)
     }
 
     pub struct DesktopMenu {
@@ -218,48 +250,7 @@ mod imp {
                 command_modifier,
             );
 
-            let speed_menu_root = NSMenuItem::new(mtm);
-            set_title(&speed_menu_root, ns_string!("Emulation Speed"));
-            let speed_menu = NSMenu::new(mtm);
-            speed_menu_root.setSubmenu(Some(&speed_menu));
-
-            let speed_2x = action_item(
-                mtm,
-                ns_string!("2x"),
-                sel!(setSpeed2x:),
-                action_target_ref,
-                None,
-                None,
-            );
-            let speed_4x = action_item(
-                mtm,
-                ns_string!("4x"),
-                sel!(setSpeed4x:),
-                action_target_ref,
-                None,
-                None,
-            );
-            let speed_8x = action_item(
-                mtm,
-                ns_string!("8x"),
-                sel!(setSpeed8x:),
-                action_target_ref,
-                None,
-                None,
-            );
-            let speed_16x = action_item(
-                mtm,
-                ns_string!("16x"),
-                sel!(setSpeed16x:),
-                action_target_ref,
-                None,
-                None,
-            );
-
-            speed_menu.addItem(&speed_2x);
-            speed_menu.addItem(&speed_4x);
-            speed_menu.addItem(&speed_8x);
-            speed_menu.addItem(&speed_16x);
+            let (speed_menu_root, speed_items) = build_speed_menu(mtm, action_target_ref);
 
             let mute_toggle = action_item(
                 mtm,
@@ -283,10 +274,7 @@ mod imp {
                 inner: Some(DesktopMenuInner {
                     _action_target: action_target,
                     _menubar: menubar,
-                    speed_2x,
-                    speed_4x,
-                    speed_8x,
-                    speed_16x,
+                    speed_items,
                     mute_toggle,
                 }),
             };
@@ -306,10 +294,9 @@ mod imp {
             };
 
             let selected = EmulationSpeed::from_multiplier(multiplier);
-            set_checked(&inner.speed_2x, selected == Some(EmulationSpeed::X2));
-            set_checked(&inner.speed_4x, selected == Some(EmulationSpeed::X4));
-            set_checked(&inner.speed_8x, selected == Some(EmulationSpeed::X8));
-            set_checked(&inner.speed_16x, selected == Some(EmulationSpeed::X16));
+            for (speed, item) in &inner.speed_items {
+                set_checked(item, selected == Some(*speed));
+            }
         }
 
         pub fn set_muted(&self, muted: bool) {
@@ -363,8 +350,10 @@ mod tests {
             EmulationSpeed::from_multiplier(16),
             Some(EmulationSpeed::X16)
         );
-        assert_eq!(EmulationSpeed::from_multiplier(1), None);
+        assert_eq!(EmulationSpeed::from_multiplier(1), Some(EmulationSpeed::X1));
+        assert_eq!(EmulationSpeed::from_multiplier(3), None);
 
+        assert_eq!(EmulationSpeed::X1.multiplier(), 1);
         assert_eq!(EmulationSpeed::X2.multiplier(), 2);
         assert_eq!(EmulationSpeed::X4.multiplier(), 4);
         assert_eq!(EmulationSpeed::X8.multiplier(), 8);

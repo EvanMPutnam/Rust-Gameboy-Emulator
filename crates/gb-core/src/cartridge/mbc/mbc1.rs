@@ -41,8 +41,8 @@ impl Mbc1 {
             return 0;
         }
 
-        let raw = self.bank_upper2 << 5;
-        Self::normalize_rom_bank(raw, rom)
+        // The bank 0 -> 1 remap applies only to the switchable region.
+        usize::from(self.bank_upper2 << 5) % Self::rom_bank_count(rom)
     }
 
     fn high_region_bank(&self, rom: &[u8]) -> usize {

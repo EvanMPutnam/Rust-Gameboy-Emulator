@@ -113,3 +113,39 @@ fn mbc5_supports_9bit_rom_banks_and_ram_banks() {
     cart.write_ram(0xA000, 0x5A).expect("write banked ram");
     assert_eq!(cart.read_ram(0xA000).expect("read banked ram"), 0x5A);
 }
+
+#[test]
+fn mbc1_mode1_maps_bank0_to_low_region_when_upper_bits_are_zero() {
+    let mut rom = make_rom(4, 0x01, 0x01, 0x00);
+    rom[0x0000] = 0xAA;
+    rom[0x4000] = 0xBB;
+
+    let mut cart = Cartridge::from_rom_bytes(rom).expect("cart parse");
+    cart.write_rom(0x6000, 0x01).expect("select mode 1");
+
+    assert_eq!(cart.read_rom(0x0000).expect("low region read"), 0xAA);
+}
+
+#[test]
+fn mbc2_register_select_uses_address_bit_8_across_whole_range() {
+    let mut rom = make_rom(4, 0x05, 0x01, 0x00);
+    rom[0x8000] = 0x22;
+
+    let mut cart = Cartridge::from_rom_bytes(rom).expect("cart parse");
+    cart.write_rom(0x0100, 0x02)
+        .expect("select bank via 0x0100");
+    assert_eq!(cart.read_rom(0x4000).expect("bank 2 read"), 0x22);
+
+    cart.write_rom(0x2000, 0x0A).expect("enable ram via 0x2000");
+    cart.write_ram(0xA000, 0x05).expect("ram write");
+    assert_eq!(cart.read_ram(0xA000).expect("ram read"), 0xF5);
+}
+
+#[test]
+fn mbc5_powers_on_with_bank1_in_switchable_region() {
+    let mut rom = make_rom(4, 0x19, 0x01, 0x00);
+    rom[0x4000] = 0x11;
+
+    let cart = Cartridge::from_rom_bytes(rom).expect("cart parse");
+    assert_eq!(cart.read_rom(0x4000).expect("default bank read"), 0x11);
+}

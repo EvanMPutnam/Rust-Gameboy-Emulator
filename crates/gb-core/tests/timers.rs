@@ -77,3 +77,17 @@ fn gameboy_step_syncs_timer_and_interrupt_registers() {
         0
     );
 }
+
+#[test]
+fn cpu_writes_to_timer_registers_take_effect() {
+    // LD A,$05; LDH (TAC),A; LD A,$AB; LDH (TMA),A; NOP...
+    let mut rom = test_rom();
+    rom[0x0100..0x0108].copy_from_slice(&[0x3E, 0x05, 0xE0, 0x07, 0x3E, 0xAB, 0xE0, 0x06]);
+    let mut gb = GameBoy::new(GbConfig::default(), rom).expect("gb init");
+
+    gb.run_cycles(64).expect("run cycles");
+
+    assert_eq!(gb.bus.read8(0xFF07).expect("read tac") & 0x07, 0x05);
+    assert_eq!(gb.bus.read8(0xFF06).expect("read tma"), 0xAB);
+    assert_ne!(gb.bus.read8(0xFF05).expect("read tima"), 0);
+}

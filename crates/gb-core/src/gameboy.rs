@@ -64,7 +64,6 @@ impl GameBoy {
 
     pub fn step(&mut self) -> Result<Cycles, GbError> {
         self.sync_interrupts_from_bus();
-        self.sync_timers_from_bus();
 
         if self.debugger.enabled() {
             let pc = self.cpu.registers().pc;
@@ -77,6 +76,9 @@ impl GameBoy {
 
         let cycles = self.cpu.step(&mut self.bus, &mut self.interrupts)?;
         self.sync_interrupts_from_bus();
+        // Pick up the CPU's timer register writes before ticking, or the
+        // export at the end of the step would overwrite them.
+        self.sync_timers_from_bus();
         self.clock.tick(cycles);
         self.timers.tick(cycles, &mut self.interrupts);
         if let Some(source_high) = self.bus.take_dma_start_request() {
@@ -252,6 +254,9 @@ impl GameBoy {
     }
 
     fn sync_timers_from_bus(&mut self) {
+        if self.bus.take_div_reset_request() {
+            self.timers.write_div();
+        }
         let regs = self.bus.timer_regs();
         self.timers.apply_bus_regs(regs);
     }

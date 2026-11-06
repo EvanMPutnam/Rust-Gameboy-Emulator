@@ -105,14 +105,14 @@ fn lcd_disable_resets_mode_and_unblocks_vram_oam() {
 }
 
 #[test]
-fn writing_ly_register_resets_to_zero() {
+fn writing_ly_register_is_ignored() {
     let mut gb = GameBoy::new(GbConfig::default(), test_rom()).expect("init gb");
     gb.bus.write8(0xFF40, 0x91).expect("enable lcd");
     gb.run_cycles(456).expect("advance one line");
     assert_eq!(gb.bus.read8(0xFF44).expect("read ly"), 1);
 
     gb.bus.write8(0xFF44, 0x99).expect("write ly");
-    assert_eq!(gb.bus.read8(0xFF44).expect("read ly"), 0);
+    assert_eq!(gb.bus.read8(0xFF44).expect("read ly"), 1);
 }
 
 #[test]

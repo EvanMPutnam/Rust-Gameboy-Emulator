@@ -32,7 +32,7 @@ fn dma_copies_exactly_160_bytes_to_oam() {
 }
 
 #[test]
-fn dma_blocks_cpu_access_to_data_regions_while_active() {
+fn dma_blocks_cpu_access_to_memory_but_not_io_while_active() {
     let cartridge = Cartridge::from_rom_bytes(test_rom()).expect("valid test rom");
     let mut bus = Bus::new(cartridge);
     let mut dma = OamDma::new();
@@ -45,10 +45,9 @@ fn dma_blocks_cpu_access_to_data_regions_while_active() {
     assert_eq!(bus.read_dma_source(0xC000).expect("raw read"), 0x12);
 
     assert_eq!(bus.read8(0x0000).expect("blocked rom read"), 0xFF);
-    assert_eq!(bus.read8(0xFF40).expect("blocked io read"), 0xFF);
 
-    bus.write8(0xFF40, 0x91).expect("blocked io write ignored");
-    assert_eq!(bus.read_dma_source(0xFF40).expect("io raw read"), 0x00);
+    bus.write8(0xFF40, 0x91).expect("io write allowed");
+    assert_eq!(bus.read8(0xFF40).expect("io read allowed"), 0x91);
 
     bus.write8(0xFF80, 0x5A).expect("hram write allowed");
     assert_eq!(bus.read8(0xFF80).expect("hram read allowed"), 0x5A);

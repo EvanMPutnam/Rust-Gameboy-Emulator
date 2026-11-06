@@ -222,11 +222,11 @@ impl DesktopRuntime {
                 return;
             }
             if code == KeyCode::F5 {
-                self.save_state(event_loop);
+                self.save_state();
                 return;
             }
             if code == KeyCode::F9 {
-                self.load_state(event_loop);
+                self.load_state();
                 return;
             }
         }
@@ -251,6 +251,7 @@ impl DesktopRuntime {
                 KeyCode::KeyS => Some(MenuCommand::SaveState),
                 KeyCode::KeyL => Some(MenuCommand::LoadState),
                 KeyCode::KeyM => Some(MenuCommand::ToggleMute),
+                KeyCode::Digit1 => Some(MenuCommand::SetEmulationSpeed(EmulationSpeed::X1)),
                 KeyCode::Digit2 => Some(MenuCommand::SetEmulationSpeed(EmulationSpeed::X2)),
                 KeyCode::Digit4 => Some(MenuCommand::SetEmulationSpeed(EmulationSpeed::X4)),
                 KeyCode::Digit8 => Some(MenuCommand::SetEmulationSpeed(EmulationSpeed::X8)),
@@ -268,15 +269,17 @@ impl DesktopRuntime {
         }
     }
 
-    fn save_state(&mut self, event_loop: &ActiveEventLoop) {
+    // A failed save or load (for example, no snapshot yet) is reported but
+    // doesn't end the session; the emulator state is unchanged on failure.
+    fn save_state(&mut self) {
         if let Err(err) = self.app.save_snapshot_to_path(&self.snapshot_path) {
-            self.set_error(event_loop, err);
+            eprintln!("save state failed: {err}");
         }
     }
 
-    fn load_state(&mut self, event_loop: &ActiveEventLoop) {
+    fn load_state(&mut self) {
         if let Err(err) = self.app.load_snapshot_from_path(&self.snapshot_path) {
-            self.set_error(event_loop, err);
+            eprintln!("load state failed: {err}");
         }
     }
 
@@ -296,8 +299,8 @@ impl DesktopRuntime {
 
     fn apply_menu_command(&mut self, event_loop: &ActiveEventLoop, command: MenuCommand) {
         match command {
-            MenuCommand::SaveState => self.save_state(event_loop),
-            MenuCommand::LoadState => self.load_state(event_loop),
+            MenuCommand::SaveState => self.save_state(),
+            MenuCommand::LoadState => self.load_state(),
             MenuCommand::SetEmulationSpeed(speed) => {
                 self.app.set_emulation_speed_multiplier(speed.multiplier());
                 if let Some(menu) = self.menu.as_ref() {

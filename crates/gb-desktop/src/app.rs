@@ -32,6 +32,8 @@ pub struct DesktopApp {
     runloop: RunLoop,
     audio_scratch: Vec<i16>,
     latest_ppu_diagnostics: Option<PpuFrameDiagnostics>,
+    /// Wall time not yet passed to the cartridge RTC, which counts whole seconds.
+    rtc_pending: Duration,
 }
 
 impl DesktopApp {
@@ -54,6 +56,7 @@ impl DesktopApp {
             runloop: RunLoop::new(),
             audio_scratch: Vec::new(),
             latest_ppu_diagnostics: None,
+            rtc_pending: Duration::ZERO,
         })
     }
 
@@ -64,9 +67,10 @@ impl DesktopApp {
             return Ok(());
         }
 
+        // A raw .sav holds only RAM, so keep the cartridge's current RTC state.
         let save = CartridgeSave {
             ram: Some(save_ram),
-            rtc: None,
+            rtc: self.gameboy.export_save()?.rtc,
         };
         self.gameboy.import_save(&save)?;
         Ok(())
@@ -98,6 +102,14 @@ impl DesktopApp {
     }
 
     pub fn tick(&mut self, elapsed: Duration) -> Result<TickSummary, GbError> {
+        // The cartridge clock runs in real time, independent of emulation speed.
+        self.rtc_pending += elapsed;
+        let rtc_seconds = self.rtc_pending.as_secs();
+        if rtc_seconds > 0 {
+            self.gameboy.tick_rtc(rtc_seconds)?;
+            self.rtc_pending -= Duration::from_secs(rtc_seconds);
+        }
+
         let cycle_budget = self.runloop.cycle_budget(elapsed);
         let cycles_ran = if cycle_budget == 0 {
             0
@@ -156,6 +168,8 @@ impl DesktopApp {
 
     pub fn set_emulation_speed_multiplier(&mut self, multiplier: u32) {
         self.runloop.set_speed_multiplier(multiplier);
+        // Fast-forward fills the queue; drop the backlog so audio doesn't lag behind video.
+        self.audio.clear();
     }
 
     #[must_use]
@@ -204,6 +218,7 @@ mod tests {
 
     use super::DesktopApp;
     use crate::input::{HostInputEvent, HostKey};
+    use gb_core::bus::Memory;
 
     fn test_rom() -> Vec<u8> {
         let mut rom = vec![0u8; 0x8000];
@@ -261,6 +276,43 @@ mod tests {
         app.load_snapshot_from_path(&path).expect("load snapshot");
 
         std::fs::remove_file(path).expect("remove snapshot");
+    }
+
+    fn rtc_rom() -> Vec<u8> {
+        let mut rom = test_rom();
+        rom[0x0147] = 0x10; // MBC3 + timer + RAM + battery
+        rom[0x0149] = 0x02; // 8 KiB RAM
+        rom
+    }
+
+    fn read_rtc_seconds(app: &mut DesktopApp) -> u8 {
+        let bus = &mut app.gameboy.bus;
+        bus.write8(0x0000, 0x0A).expect("enable ram");
+        bus.write8(0x4000, 0x08).expect("select seconds");
+        bus.write8(0x6000, 0x00).expect("arm latch");
+        bus.write8(0x6000, 0x01).expect("latch");
+        bus.read8(0xA000).expect("read seconds")
+    }
+
+    #[test]
+    fn raw_save_loads_on_rtc_cartridge() {
+        let mut app = DesktopApp::from_rom_bytes(rtc_rom(), None).expect("init app");
+        let path = temp_path("desktop_rtc_save");
+        std::fs::write(&path, vec![0x5A; 8 * 1024]).expect("write save");
+
+        app.load_save_from_path(&path).expect("load save");
+
+        std::fs::remove_file(path).expect("remove save");
+    }
+
+    #[test]
+    fn rtc_advances_with_wall_time() {
+        let mut app = DesktopApp::from_rom_bytes(rtc_rom(), None).expect("init app");
+        app.tick(Duration::from_millis(700)).expect("tick");
+        assert_eq!(read_rtc_seconds(&mut app), 0);
+
+        app.tick(Duration::from_millis(700)).expect("tick");
+        assert_eq!(read_rtc_seconds(&mut app), 1);
     }
 
     #[test]

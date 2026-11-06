@@ -129,6 +129,10 @@ impl PpuDiagnosticsState {
 }
 
 #[derive(Serialize, Deserialize)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "PPU state mirrors independent hardware latches."
+)]
 pub struct Ppu {
     mode: LcdMode,
     mode_cycles: Cycles,
@@ -140,6 +144,9 @@ pub struct Ppu {
     lcd_enabled: bool,
     #[serde(skip)]
     diagnostics: PpuDiagnosticsState,
+    /// Set once LY matched WY at the start of a line this frame.
+    #[serde(skip)]
+    window_y_reached: bool,
 }
 
 impl Default for Ppu {
@@ -153,6 +160,7 @@ impl Default for Ppu {
             window_line_counter: 0,
             lcd_enabled: false,
             diagnostics: PpuDiagnosticsState::default(),
+            window_y_reached: false,
         }
     }
 }
@@ -239,6 +247,9 @@ impl Ppu {
     fn advance_mode(&mut self, bus: &mut Bus, interrupts: &mut InterruptController) {
         match self.mode {
             LcdMode::OamScan => {
+                if bus.io[0x44] == bus.io[0x4A] {
+                    self.window_y_reached = true;
+                }
                 self.mode = LcdMode::Transfer;
             }
             LcdMode::Transfer => {
@@ -263,6 +274,7 @@ impl Ppu {
                     bus.io[0x44] = 0;
                     self.mode = LcdMode::OamScan;
                     self.window_line_counter = 0;
+                    self.window_y_reached = false;
                     self.diagnostics.begin_frame();
                 } else {
                     bus.io[0x44] = next_ly;
@@ -324,7 +336,7 @@ impl Ppu {
             bg_color_ids[x] = Self::bg_color_for_pixel(x as u8, ly as u8, bus);
         }
 
-        if (lcdc & 0x20) != 0 && (lcdc & 0x01) != 0 && Self::window_visible_on_line(ly as u8, bus) {
+        if (lcdc & 0x20) != 0 && (lcdc & 0x01) != 0 && self.window_y_reached && bus.io[0x4B] < 167 {
             Self::apply_window_line(self.window_line_counter, bus, &mut bg_color_ids);
             self.window_line_counter = self.window_line_counter.wrapping_add(1);
         }
@@ -367,12 +379,6 @@ impl Ppu {
         let bg_x = x.wrapping_add(scx);
         let bg_y = ly.wrapping_add(scy);
         Self::tilemap_color(lcdc, bg_x, bg_y, false, bus)
-    }
-
-    fn window_visible_on_line(ly: u8, bus: &Bus) -> bool {
-        let wx = bus.io[0x4B];
-        let wy = bus.io[0x4A];
-        ly >= wy && wx < 167
     }
 
     fn apply_window_line(window_line: u8, bus: &Bus, line: &mut [u8; SCREEN_WIDTH]) {
@@ -432,15 +438,13 @@ impl Ppu {
 
         for x in 0..SCREEN_WIDTH {
             for sprite in &sprites[..sprite_count] {
-                let sprite_x = sprite.x.wrapping_sub(8);
-                let sprite_y = sprite.y.wrapping_sub(16);
-
-                let sx = x as i16 - i16::from(sprite_x);
+                // OAM stores X+8 and Y+16, so sprites can sit partly off the top or left edge.
+                let sx = x as i16 + 8 - i16::from(sprite.x);
                 if !(0..8).contains(&sx) {
                     continue;
                 }
 
-                let sy = i16::from(ly) - i16::from(sprite_y);
+                let sy = i16::from(ly) + 16 - i16::from(sprite.y);
                 if sy < 0 || sy >= i16::from(sprite_height) {
                     continue;
                 }
@@ -483,9 +487,10 @@ impl Ppu {
                     continue;
                 }
 
+                // The first opaque sprite pixel wins even when the background hides it.
                 if (sprite.attr & 0x80) != 0 && bg_color_ids[x] != 0 {
                     stats.priority_skips = stats.priority_skips.wrapping_add(1);
-                    continue;
+                    break;
                 }
 
                 let palette = if (sprite.attr & 0x10) != 0 {
@@ -512,6 +517,7 @@ impl Ppu {
         self.mode = LcdMode::HBlank;
         self.mode_cycles = 0;
         self.window_line_counter = 0;
+        self.window_y_reached = false;
         self.stat_irq_line = false;
         bus.io[0x44] = 0;
         self.diagnostics.begin_frame();
@@ -524,6 +530,7 @@ impl Ppu {
         self.mode = LcdMode::OamScan;
         self.mode_cycles = 0;
         self.window_line_counter = 0;
+        self.window_y_reached = false;
         self.stat_irq_line = false;
         bus.io[0x44] = 0;
         self.diagnostics.begin_frame();

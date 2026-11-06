@@ -8,6 +8,9 @@ use crate::error::DesktopError;
 
 const CORE_SAMPLE_RATE_HZ: u32 = 48_000;
 const RESAMPLER_CHUNK_SAMPLES: usize = 2_048;
+/// Queued samples (about 43 ms of stereo audio) required before playback starts or
+/// resumes after an underflow, so jitter in the emulation loop doesn't starve output.
+const RESAMPLER_PRIME_SAMPLES: usize = 4_096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResamplerMode {
@@ -142,34 +145,47 @@ impl AudioQueue {
         out
     }
 
-    pub fn dequeue_into(&self, output: &mut [i16]) {
-        if output.is_empty() {
-            return;
-        }
-
+    /// Moves up to `max_samples` queued samples, in whole stereo frames, to the
+    /// end of `out` and returns how many moved. Muted samples move as silence.
+    pub fn dequeue_available(&self, out: &mut VecDeque<i16>, max_samples: usize) -> usize {
         let Ok(mut state) = self.inner.lock() else {
-            output.fill(0);
-            return;
+            return 0;
         };
 
+        let count = state.queue.len().min(max_samples) & !1;
         let muted = state.muted;
-        let available = state.queue.len().min(output.len());
-        for slot in output.iter_mut().take(available) {
-            if let Some(sample) = state.queue.pop_front() {
-                *slot = if muted { 0 } else { sample };
-            }
-        }
-        for slot in output.iter_mut().skip(available) {
-            *slot = 0;
-        }
+        out.extend(
+            state
+                .queue
+                .drain(..count)
+                .map(|sample| if muted { 0 } else { sample }),
+        );
+        state.dequeued_samples = state.dequeued_samples.wrapping_add(usize_to_u64(count));
+        count
+    }
 
-        state.dequeued_samples = state.dequeued_samples.wrapping_add(usize_to_u64(available));
+    #[must_use]
+    pub fn queued_samples(&self) -> usize {
+        self.inner.lock().map_or(0, |state| state.queue.len())
+    }
 
-        if available < output.len() {
+    fn record_underflow_event(&self) {
+        if let Ok(mut state) = self.inner.lock() {
             state.underflow_events = state.underflow_events.wrapping_add(1);
+        }
+    }
+
+    fn record_underflow_silence(&self, samples: usize) {
+        if let Ok(mut state) = self.inner.lock() {
             state.underflow_silence_samples = state
                 .underflow_silence_samples
-                .wrapping_add(usize_to_u64(output.len().saturating_sub(available)));
+                .wrapping_add(usize_to_u64(samples));
+        }
+    }
+
+    pub fn clear(&self) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.queue.clear();
         }
     }
 
@@ -499,10 +515,15 @@ impl StereoResampler {
 
     fn next_frame(&mut self, queue: &AudioQueue) -> (i16, i16) {
         if !self.primed {
-            let (left, right) = self.dequeue_stereo_frame(queue);
-            self.current_left = left;
-            self.current_right = right;
+            if self.cache.len() + queue.queued_samples() < RESAMPLER_PRIME_SAMPLES {
+                queue.record_underflow_silence(2);
+                return (0, 0);
+            }
             self.primed = true;
+            if let Some((left, right)) = self.dequeue_stereo_frame(queue) {
+                self.current_left = left;
+                self.current_right = right;
+            }
         }
 
         let out = (self.current_left, self.current_right);
@@ -512,7 +533,12 @@ impl StereoResampler {
 
         while self.phase_accum >= u64::from(self.output_rate_hz) {
             self.phase_accum -= u64::from(self.output_rate_hz);
-            let (left, right) = self.dequeue_stereo_frame(queue);
+            let Some((left, right)) = self.dequeue_stereo_frame(queue) else {
+                queue.record_underflow_event();
+                self.primed = false;
+                self.phase_accum = 0;
+                break;
+            };
             self.current_left = left;
             self.current_right = right;
         }
@@ -520,16 +546,14 @@ impl StereoResampler {
         out
     }
 
-    fn dequeue_stereo_frame(&mut self, queue: &AudioQueue) -> (i16, i16) {
+    fn dequeue_stereo_frame(&mut self, queue: &AudioQueue) -> Option<(i16, i16)> {
         if self.cache.len() < 2 {
-            let mut pulled = vec![0i16; RESAMPLER_CHUNK_SAMPLES.max(2)];
-            queue.dequeue_into(&mut pulled);
-            self.cache.extend(pulled);
+            queue.dequeue_available(&mut self.cache, RESAMPLER_CHUNK_SAMPLES);
         }
 
-        let left = self.cache.pop_front().unwrap_or_default();
-        let right = self.cache.pop_front().unwrap_or_default();
-        (left, right)
+        let left = self.cache.pop_front()?;
+        let right = self.cache.pop_front()?;
+        Some((left, right))
     }
 }
 
@@ -555,8 +579,17 @@ fn usize_to_u64(value: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        AudioQueue, StereoResampler, map_stereo_to_channel, write_i16_data, write_u16_data,
+        AudioQueue, RESAMPLER_PRIME_SAMPLES, StereoResampler, map_stereo_to_channel,
+        write_i16_data, write_u16_data,
     };
+
+    /// Queue holding `head` followed by silence, enough to start playback.
+    fn primed_queue(head: &[i16]) -> AudioQueue {
+        let queue = AudioQueue::new(RESAMPLER_PRIME_SAMPLES * 2);
+        queue.enqueue(head);
+        queue.enqueue(&vec![0; RESAMPLER_PRIME_SAMPLES - head.len()]);
+        queue
+    }
 
     #[test]
     fn overflow_drops_oldest_samples_and_underflow_is_counted() {
@@ -575,19 +608,49 @@ mod tests {
     }
 
     #[test]
-    fn callback_write_pads_with_silence_on_underflow() {
-        let queue = AudioQueue::new(8);
+    fn playback_waits_for_buffer_before_starting() {
+        let queue = AudioQueue::new(RESAMPLER_PRIME_SAMPLES * 2);
         queue.enqueue(&[10, -10, 20, -20]);
 
-        let mut out = [0i16; 6];
+        let mut out = [7i16; 4];
         let mut resampler = StereoResampler::new(48_000, 48_000);
         write_i16_data(&mut out, 2, &queue, &mut resampler);
-        assert_eq!(out, [10, -10, 20, -20, 0, 0]);
+
+        assert_eq!(out, [0, 0, 0, 0]);
+        assert_eq!(queue.stats().queued_samples, 4);
+        assert_eq!(queue.stats().underflow_silence_samples, 4);
+    }
+
+    #[test]
+    fn partial_chunks_play_without_silence_padding() {
+        let queue = primed_queue(&[10, -10, 20, -20]);
+        let mut resampler = StereoResampler::new(48_000, 48_000);
+
+        // Leave two frames queued; the resampler reads one frame ahead.
+        let mut out = vec![0i16; RESAMPLER_PRIME_SAMPLES - 4];
+        write_i16_data(&mut out, 2, &queue, &mut resampler);
+        assert_eq!(&out[..4], &[10, -10, 20, -20]);
+
+        // Samples that arrive mid-stream continue playback directly.
+        queue.enqueue(&[30, -30, 40, -40]);
+        let mut next = [0i16; 6];
+        write_i16_data(&mut next, 2, &queue, &mut resampler);
+        assert_eq!(next, [0, 0, 0, 0, 30, -30]);
+        assert_eq!(queue.stats().underflow_events, 0);
+        assert_eq!(queue.stats().underflow_silence_samples, 0);
+    }
+
+    #[test]
+    fn underflow_outputs_silence_until_buffer_refills() {
+        let queue = primed_queue(&[]);
+        let mut resampler = StereoResampler::new(48_000, 48_000);
+
+        let mut out = vec![1i16; RESAMPLER_PRIME_SAMPLES + 4];
+        write_i16_data(&mut out, 2, &queue, &mut resampler);
+
+        assert!(out.iter().all(|&sample| sample == 0));
         assert_eq!(queue.stats().underflow_events, 1);
-        assert_eq!(queue.stats().underflow_silence_samples, 2_044);
-        assert_eq!(queue.stats().callback_requested_samples, 6);
-        assert_eq!(queue.stats().callback_min_requested_samples, 6);
-        assert_eq!(queue.stats().callback_max_requested_samples, 6);
+        assert_eq!(queue.stats().underflow_silence_samples, 4);
     }
 
     #[test]
@@ -617,8 +680,7 @@ mod tests {
 
     #[test]
     fn u16_mapping_uses_shifted_signed_range() {
-        let queue = AudioQueue::new(8);
-        queue.enqueue(&[-32_768, 32_767, 0, 0]);
+        let queue = primed_queue(&[-32_768, 32_767, 0, 0]);
 
         let mut out = [0u16; 4];
         let mut resampler = StereoResampler::new(48_000, 48_000);
@@ -630,8 +692,7 @@ mod tests {
 
     #[test]
     fn resampler_downsamples_when_output_rate_is_lower() {
-        let queue = AudioQueue::new(64);
-        queue.enqueue(&[100, 100, 200, 200, 300, 300, 400, 400]);
+        let queue = primed_queue(&[100, 100, 200, 200, 300, 300, 400, 400]);
 
         let mut resampler = StereoResampler::new(48_000, 24_000);
         let first = resampler.next_frame(&queue);
@@ -647,8 +708,8 @@ mod tests {
         queue.enqueue(&[11, -11, 22, -22]);
         queue.set_muted(true);
 
-        let mut out = [0i16; 4];
-        queue.dequeue_into(&mut out);
+        let mut out = std::collections::VecDeque::new();
+        queue.dequeue_available(&mut out, 8);
 
         assert_eq!(out, [0, 0, 0, 0]);
         assert_eq!(queue.stats().queued_samples, 0);

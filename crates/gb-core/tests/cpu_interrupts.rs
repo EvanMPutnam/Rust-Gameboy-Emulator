@@ -65,3 +65,14 @@ fn halt_wakes_when_interrupt_pending_even_if_ime_disabled() {
         .expect("cpu should wake and execute nop");
     assert!(!cpu.is_halted());
 }
+
+#[test]
+fn di_right_after_ei_keeps_interrupts_disabled() {
+    let (mut cpu, mut bus, mut interrupts) = setup(&[0xFB, 0xF3, 0x00]);
+
+    for _ in 0..3 {
+        cpu.step(&mut bus, &mut interrupts).expect("step");
+    }
+
+    assert!(!cpu.ime());
+}

@@ -48,10 +48,11 @@ impl Mapper for Mbc2 {
 
     fn write_rom(&mut self, addr: u16, value: u8) -> Result<(), CartridgeError> {
         match addr {
-            0x0000..=0x1FFF if (addr & 0x0100) == 0 => {
+            // Address bit 8 picks the register anywhere in 0x0000-0x3FFF.
+            0x0000..=0x3FFF if (addr & 0x0100) == 0 => {
                 self.ram_enabled = (value & 0x0F) == 0x0A;
             }
-            0x2000..=0x3FFF if (addr & 0x0100) != 0 => {
+            0x0000..=0x3FFF => {
                 let mut bank = value & 0x0F;
                 if bank == 0 {
                     bank = 1;

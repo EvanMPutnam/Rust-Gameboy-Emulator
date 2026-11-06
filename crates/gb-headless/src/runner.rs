@@ -94,9 +94,10 @@ pub fn run(config: &RunnerConfig) -> Result<RunReport, RunnerError> {
     if let Some(path) = &config.save_in_path {
         let save_ram = fs::read(path)?;
         if !save_ram.is_empty() {
+            // A raw .sav holds only RAM, so keep the cartridge's current RTC state.
             let save = CartridgeSave {
                 ram: Some(save_ram),
-                rtc: None,
+                rtc: gameboy.export_save()?.rtc,
             };
             gameboy.import_save(&save)?;
         }

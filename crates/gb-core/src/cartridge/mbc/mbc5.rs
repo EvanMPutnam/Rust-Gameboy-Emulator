@@ -2,12 +2,23 @@ use crate::cartridge::mbc::Mapper;
 use crate::error::CartridgeError;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Mbc5 {
     ram_enabled: bool,
     rom_bank_low: u8,
     rom_bank_high: u8,
     ram_bank: u8,
+}
+
+impl Default for Mbc5 {
+    fn default() -> Self {
+        Self {
+            ram_enabled: false,
+            rom_bank_low: 1,
+            rom_bank_high: 0,
+            ram_bank: 0,
+        }
+    }
 }
 
 impl Mbc5 {

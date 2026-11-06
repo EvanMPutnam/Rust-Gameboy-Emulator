@@ -27,6 +27,27 @@ pub struct TimerRegs {
     pub tac: u8,
 }
 
+/// Bits that read as 1 for each I/O register on DMG: unused bits, write-only
+/// bits and unmapped registers. P1, SB and SC are handled by their devices.
+const IO_READ_MASK: [u8; 0x80] = [
+    0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, 0xF8, // FF00-FF07
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xE0, // FF08-FF0F
+    0x80, 0x3F, 0x00, 0xFF, 0xBF, 0xFF, 0x3F, 0x00, // FF10-FF17
+    0xFF, 0xBF, 0x7F, 0xFF, 0x9F, 0xFF, 0xBF, 0xFF, // FF18-FF1F
+    0xFF, 0x00, 0x00, 0xBF, 0x00, 0x00, 0x70, 0xFF, // FF20-FF27
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // FF28-FF2F
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // FF30-FF37
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // FF38-FF3F
+    0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // FF40-FF47
+    0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, // FF48-FF4F
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // FF50-FF57
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // FF58-FF5F
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // FF60-FF67
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // FF68-FF6F
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // FF70-FF77
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // FF78-FF7F
+];
+
 pub trait Memory {
     fn read8(&self, addr: Address) -> Result<Byte, BusError>;
     fn write8(&mut self, addr: Address, val: Byte) -> Result<(), BusError>;
@@ -46,6 +67,10 @@ pub trait Memory {
 }
 
 #[derive(Serialize, Deserialize)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "Bus latches mirror independent hardware access and request flags."
+)]
 pub struct Bus {
     pub cartridge: Cartridge,
     #[serde(with = "BigArray")]
@@ -66,6 +91,8 @@ pub struct Bus {
     oam_blocked: bool,
     dma_active: bool,
     dma_start_request: Option<u8>,
+    #[serde(skip)]
+    div_reset_request: bool,
     #[serde(skip)]
     apu_write_mask: u128,
     #[serde(skip)]
@@ -97,6 +124,7 @@ impl Bus {
             oam_blocked: false,
             dma_active: false,
             dma_start_request: None,
+            div_reset_request: false,
             apu_write_mask: 0,
             debug: DebugTraceState::default(),
         }
@@ -205,6 +233,11 @@ impl Bus {
     }
 
     #[must_use]
+    pub fn take_div_reset_request(&mut self) -> bool {
+        core::mem::take(&mut self.div_reset_request)
+    }
+
+    #[must_use]
     pub fn take_apu_write_mask(&mut self) -> u128 {
         let mask = self.apu_write_mask;
         self.apu_write_mask = 0;
@@ -251,7 +284,8 @@ impl Bus {
     }
 
     fn cpu_access_blocked_by_dma(addr: Address) -> bool {
-        !matches!(addr, HRAM_START..=HRAM_END)
+        // I/O registers, HRAM and IE sit on the CPU's internal bus.
+        addr < IO_START
     }
 
     fn read8_raw(&self, addr: Address, ignore_ppu_block: bool) -> Result<Byte, BusError> {
@@ -286,7 +320,10 @@ impl Bus {
                 0xFF00 => Ok(self.joypad.read_p1()),
                 0xFF01 => Ok(self.serial.read_sb()),
                 0xFF02 => Ok(self.serial.read_sc()),
-                _ => Ok(self.io[usize::from(addr - IO_START)]),
+                _ => {
+                    let index = usize::from(addr - IO_START);
+                    Ok(self.io[index] | IO_READ_MASK[index])
+                }
             },
             HRAM_START..=HRAM_END => Ok(self.hram[usize::from(addr - HRAM_START)]),
             IE_ADDR => Ok(self.ie),
@@ -370,15 +407,14 @@ impl Memory for Bus {
                 }
                 0xFF04 => {
                     self.io[0x04] = 0;
+                    self.div_reset_request = true;
                 }
                 0xFF41 => {
                     let writable = val & 0xF8;
                     let read_only = self.io[0x41] & 0x07;
                     self.io[0x41] = writable | read_only;
                 }
-                0xFF44 => {
-                    self.io[0x44] = 0;
-                }
+                0xFF44 => {} // LY is read-only.
                 0xFF46 => {
                     self.io[0x46] = val;
                     self.dma_start_request = Some(val);

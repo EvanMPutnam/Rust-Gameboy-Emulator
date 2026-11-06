@@ -104,7 +104,8 @@ impl Cpu {
         let instruction = decode(opcode);
         let cycles = execute::execute(self, mem, instruction)?;
 
-        if enable_ime_after_step {
+        // A DI right after EI cancels the pending enable.
+        if enable_ime_after_step && self.ime_scheduled {
             self.ime = true;
             self.ime_scheduled = false;
         }
